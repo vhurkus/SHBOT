@@ -812,25 +812,15 @@ class ArbitrageBot {
             });
 
             // ============================================================================
-            // SPREAD KONTROLÜ - Sadece negatif spread'de emir açma!
+            // SPREAD KONTROLÜ (Kullanıcı isteğiyle değiştirildi)
             // ============================================================================
-            
-            // Negatif spread kontrolü (arbitraj tersten çalışıyor)
-            if (profitScenario.profit.spread < 0) {
-                logger.warn('⚠️ Negatif spread - Arbitraj tersten çalışıyor, emir açılmıyor!', {
-                    spread: profitScenario.profit.spread.toFixed(2) + '%',
-                    binanceFiyat: scenario === 'SELL' ? this.prices.binance.ask : this.prices.binance.bid,
-                    btcturkFiyat: scenario === 'SELL' ? this.prices.btcturk.bid : this.prices.btcturk.ask,
-                    reason: 'Binance fiyatı BTCTurk\'ten daha pahalı - zarar eder'
-                });
-                return null;
-            }
+            // Strateji gereği, spread negatif olsa bile karlı fiyattan emir açıp bekliyoruz.
+            // Bu yüzden negatif spread kontrolü kaldırıldı. Emir her zaman açılmayı deneyecek.
 
-            // Market Maker Mode: Pozitif spread varsa emir aç (minSpread kontrolü yok)
-            logger.info('✅ Spread pozitif, market maker mode aktif', {
+            // Market Maker Mode: Her zaman emir açmayı dene
+            logger.info('✅ Market maker mode: Emir açma denemesi yapılıyor...', {
                 spread: profitScenario.profit.spread.toFixed(2) + '%',
-                expectedProfit: profitScenario.profit.percent.toFixed(2) + '%',
-                note: 'Emir açılıyor, spread pozitif'
+                note: 'Spread negatif olsa bile karlı fiyattan emir açılacak.'
             });
 
             // ============================================================================
