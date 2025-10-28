@@ -1,0 +1,689 @@
+/**
+ * Binance Exchange Client
+ * REST API implementation for Spot trading
+ */
+
+import crypto from 'crypto';
+import https from 'https';
+import { URL } from 'url';
+import WebSocket from 'ws';
+import logger from '../utils/logger.js';
+
+class BinanceClient {
+    constructor(config) {
+        this.apiKey = config.apiKey;
+        this.apiSecret = config.apiSecret;
+        this.baseURL = config.baseURL || 'https://api.binance.com';
+
+        this.requestQueue = [];
+        this.isProcessingQueue = false;
+        this.lastRequestTime = 0;
+        this.minRequestInterval = 50; // 1200 req/min = ~50ms interval
+
+        // ✅ DÜZELTME: Server time senkronizasyonu
+        this.serverTimeOffset = 0; // Local time - Server time
+        this.lastTimeSyncTime = 0;
+        this.timeSyncInterval = 60000; // 60 saniye
+
+        // WebSocket için
+        this.ws = null;
+        this.wsReconnectAttempts = 0;
+
+        // XRPUSDT precision cache (from /exchangeInfo)
+        this.xrpPrecision = {
+            stepSize: 0.1,        // LOT_SIZE filter - XRPUSDT quantity must be multiple of 0.1
+            minQty: 0.1,          // Minimum quantity
+            maxQty: 9222449.0,    // Maximum quantity
+            lastUpdate: null
+        };
+    }
+
+    /**
+     * HMAC SHA256 imza oluşturma
+     */
+    generateSignature(queryString) {
+        return crypto
+            .createHmac('sha256', this.apiSecret)
+            .update(queryString)
+            .digest('hex');
+    }
+
+    /**
+     * ✅ DÜZELTME: Binance server time ile senkronize timestamp
+     */
+    async getTimestamp() {
+        // Server time sync gerekli mi?
+        const now = Date.now();
+        if (now - this.lastTimeSyncTime > this.timeSyncInterval) {
+            await this.syncServerTime();
+        }
+
+        // Offset'i uygula
+        return Date.now() - this.serverTimeOffset;
+    }
+
+    /**
+     * ✅ YENİ: Binance server time'ı çek ve offset hesapla
+     */
+    async syncServerTime() {
+        try {
+            const startTime = Date.now();
+            const response = await this.makeRequestDirect('GET', '/api/v3/time', {}, false);
+            const endTime = Date.now();
+
+            const serverTime = response.serverTime;
+            const localTime = Math.floor((startTime + endTime) / 2); // RTT kompansasyonu
+
+            this.serverTimeOffset = localTime - serverTime;
+            this.lastTimeSyncTime = Date.now();
+
+            logger.info('🕐 Binance server time senkronize edildi', {
+                offset: this.serverTimeOffset + 'ms',
+                serverTime: new Date(serverTime).toISOString(),
+                localTime: new Date(localTime).toISOString()
+            });
+        } catch (error) {
+            logger.warn('⚠️  Server time sync başarısız, local time kullanılıyor', {
+                error: error.message
+            });
+            // Hata durumunda offset'i sıfırla
+            this.serverTimeOffset = 0;
+        }
+    }
+
+    /**
+     * Query string oluşturma
+     */
+    buildQueryString(params) {
+        return Object.keys(params)
+            .map(key => `${key}=${encodeURIComponent(params[key])}`)
+            .join('&');
+    }
+
+    /**
+     * Rate-limited API request
+     */
+    async makeRequest(method, endpoint, params = {}, signed = false) {
+        return new Promise((resolve, reject) => {
+            this.requestQueue.push({ method, endpoint, params, signed, resolve, reject });
+            this.processQueue();
+        });
+    }
+
+    /**
+     * ✅ YENİ: Direkt istek (queue'suz, server time sync için)
+     */
+    async makeRequestDirect(method, endpoint, params = {}, signed = false) {
+        return this.executeRequest(method, endpoint, params, signed);
+    }
+
+    /**
+     * Process request queue with rate limiting
+     */
+    async processQueue() {
+        if (this.isProcessingQueue || this.requestQueue.length === 0) {
+            return;
+        }
+
+        this.isProcessingQueue = true;
+
+        while (this.requestQueue.length > 0) {
+            const timeSinceLastRequest = Date.now() - this.lastRequestTime;
+            if (timeSinceLastRequest < this.minRequestInterval) {
+                await this.sleep(this.minRequestInterval - timeSinceLastRequest);
+            }
+
+            const { method, endpoint, params, signed, resolve, reject } = this.requestQueue.shift();
+            
+            try {
+                const result = await this.executeRequest(method, endpoint, params, signed);
+                this.lastRequestTime = Date.now();
+                resolve(result);
+            } catch (error) {
+                reject(error);
+            }
+        }
+
+        this.isProcessingQueue = false;
+    }
+
+    /**
+     * Execute HTTP request with native HTTPS
+     */
+    async executeRequest(method, endpoint, params = {}, signed = false) {
+        try {
+            // Signed endpoint için signature ekle
+            if (signed) {
+                params.timestamp = await this.getTimestamp(); // ✅ await eklendi
+                params.recvWindow = 10000; // ✅ 10 saniye window (timestamp tolerance)
+                const queryString = this.buildQueryString(params);
+                const signature = this.generateSignature(queryString);
+                params.signature = signature;
+            }
+
+            const queryString = this.buildQueryString(params);
+            const url = new URL(`${this.baseURL}${endpoint}?${queryString}`);
+
+            const options = {
+                hostname: url.hostname,
+                path: url.pathname + url.search,
+                method: method,
+                headers: {
+                    'X-MBX-APIKEY': this.apiKey,
+                    'Content-Type': 'application/json'
+                }
+            };
+
+            return new Promise((resolve, reject) => {
+                const req = https.request(options, (res) => {
+                    let data = '';
+
+                    res.on('data', (chunk) => {
+                        data += chunk;
+                    });
+
+                    res.on('end', () => {
+                        try {
+                            const jsonData = JSON.parse(data);
+                            
+                            if (res.statusCode >= 200 && res.statusCode < 300) {
+                                logger.api(`Binance ${method} ${endpoint}`, {
+                                    status: res.statusCode
+                                });
+                                resolve(jsonData);
+                            } else {
+                                logger.error(`Binance API Error: ${method} ${endpoint}`, {
+                                    status: res.statusCode,
+                                    message: jsonData.msg || jsonData.message,
+                                    code: jsonData.code
+                                });
+                                const error = new Error(`Request failed with status code ${res.statusCode}`);
+                                error.response = { data: jsonData, status: res.statusCode };
+                                reject(error);
+                            }
+                        } catch (parseError) {
+                            reject(new Error(`Failed to parse response: ${data}`));
+                        }
+                    });
+                });
+
+                req.on('error', (error) => {
+                    logger.error('Binance request error:', error.message);
+                    reject(error);
+                });
+
+                req.end();
+            });
+
+        } catch (error) {
+            logger.error(`Binance API Error: ${method} ${endpoint}`, {
+                status: error.response?.status,
+                message: error.response?.data?.msg || error.message,
+                code: error.response?.data?.code
+            });
+            throw error;
+        }
+    }
+
+    /**
+     * Test connection
+     */
+    async testConnection() {
+        try {
+            const url = new URL(`${this.baseURL}/api/v3/ping`);
+            
+            return new Promise((resolve, reject) => {
+                https.get(url, (res) => {
+                    let data = '';
+                    res.on('data', (chunk) => { data += chunk; });
+                    res.on('end', () => {
+                        if (res.statusCode === 200) {
+                            logger.info('✅ Binance bağlantı testi başarılı');
+                            resolve(JSON.parse(data || '{}'));
+                        } else {
+                            reject(new Error(`Status ${res.statusCode}`));
+                        }
+                    });
+                }).on('error', reject);
+            });
+        } catch (error) {
+            logger.error('❌ Binance bağlantı hatası:', error.message);
+            throw error;
+        }
+    }
+
+    /**
+     * Get server time
+     */
+    async getServerTime() {
+        const url = new URL(`${this.baseURL}/api/v3/time`);
+        return new Promise((resolve, reject) => {
+            https.get(url, (res) => {
+                let data = '';
+                res.on('data', (chunk) => { data += chunk; });
+                res.on('end', () => resolve(JSON.parse(data)));
+            }).on('error', reject);
+        });
+    }
+
+    /**
+     * Get account information (balances)
+     */
+    async getBalances() {
+        try {
+            const result = await this.makeRequest('GET', '/api/v3/account', {}, true);
+            
+            const balances = {};
+            if (result.balances) {
+                result.balances.forEach(item => {
+                    const free = parseFloat(item.free);
+                    const locked = parseFloat(item.locked);
+                    
+                    if (free > 0 || locked > 0) {
+                        balances[item.asset] = {
+                            free: free,
+                            locked: locked,
+                            total: free + locked
+                        };
+                    }
+                });
+            }
+            
+            logger.balance('Binance bakiyeler alındı', {
+                assets: Object.keys(balances)
+            });
+            
+            return balances;
+        } catch (error) {
+            logger.error('Binance bakiye çekme hatası:', error.message);
+            throw error;
+        }
+    }
+
+    /**
+     * Get 24hr ticker
+     */
+    async getTicker24h(symbol = 'XRPUSDT') {
+        try {
+            const url = new URL(`${this.baseURL}/api/v3/ticker/24hr?symbol=${symbol}`);
+            
+            return new Promise((resolve, reject) => {
+                https.get(url, (res) => {
+                    let data = '';
+                    res.on('data', (chunk) => { data += chunk; });
+                    res.on('end', () => {
+                        const jsonData = JSON.parse(data);
+                        resolve({
+                            symbol: jsonData.symbol,
+                            last: parseFloat(jsonData.lastPrice),
+                            bid: parseFloat(jsonData.bidPrice),
+                            ask: parseFloat(jsonData.askPrice),
+                            high: parseFloat(jsonData.highPrice),
+                            low: parseFloat(jsonData.lowPrice),
+                            volume: parseFloat(jsonData.volume),
+                            quoteVolume: parseFloat(jsonData.quoteVolume),
+                            priceChange: parseFloat(jsonData.priceChange),
+                            priceChangePercent: parseFloat(jsonData.priceChangePercent),
+                            timestamp: jsonData.closeTime
+                        });
+                    });
+                }).on('error', (error) => {
+                    logger.error('Binance ticker hatası:', error.message);
+                    reject(error);
+                });
+            });
+        } catch (error) {
+            logger.error('Binance ticker hatası:', error.message);
+            throw error;
+        }
+    }
+
+    /**
+     * Get order book
+     */
+    async getOrderBook(symbol = 'XRPUSDT', limit = 10) {
+        try {
+            const url = new URL(`${this.baseURL}/api/v3/depth?symbol=${symbol}&limit=${limit}`);
+            
+            return new Promise((resolve, reject) => {
+                https.get(url, (res) => {
+                    let data = '';
+                    res.on('data', (chunk) => { data += chunk; });
+                    res.on('end', () => {
+                        const jsonData = JSON.parse(data);
+                        resolve({
+                            bids: jsonData.bids.map(b => ({
+                                price: parseFloat(b[0]),
+                                amount: parseFloat(b[1])
+                            })),
+                            asks: jsonData.asks.map(a => ({
+                                price: parseFloat(a[0]),
+                                amount: parseFloat(a[1])
+                            })),
+                            timestamp: Date.now()
+                        });
+                    });
+                }).on('error', (error) => {
+                    logger.error('Binance orderbook hatası:', error.message);
+                    reject(error);
+                });
+            });
+        } catch (error) {
+            logger.error('Binance orderbook hatası:', error.message);
+            throw error;
+        }
+    }
+
+    /**
+     * Create market order
+     */
+    async createMarketOrder(params) {
+        try {
+            const orderParams = {
+                symbol: params.symbol,
+                side: params.side.toUpperCase(), // BUY or SELL
+                type: 'MARKET',
+                quantity: parseFloat(params.quantity) // Binance quantity formatını otomatik yapacak
+            };
+            
+            logger.debug('📋 Binance Market Order Parameters:', orderParams);
+            
+            const result = await this.makeRequest('POST', '/api/v3/order', orderParams, true);
+            
+            logger.order(`✅ Binance market ${params.side} emri gerçekleşti`, {
+                orderId: result.orderId,
+                symbol: params.symbol,
+                side: params.side,
+                quantity: params.quantity,
+                executedQty: result.executedQty,
+                cummulativeQuoteQty: result.cummulativeQuoteQty
+            });
+            
+            return {
+                id: result.orderId,
+                symbol: result.symbol,
+                side: result.side,
+                type: result.type,
+                quantity: parseFloat(result.executedQty),
+                price: parseFloat(result.cummulativeQuoteQty) / parseFloat(result.executedQty),
+                status: result.status,
+                fills: result.fills,
+                timestamp: result.transactTime
+            };
+        } catch (error) {
+            logger.error('❌ Binance market emir hatası:', {
+                error: error.response?.data || error.message,
+                params
+            });
+            throw error;
+        }
+    }
+
+    /**
+     * Query order
+     */
+    async getOrder(symbol, orderId) {
+        try {
+            const result = await this.makeRequest('GET', '/api/v3/order', {
+                symbol: symbol,
+                orderId: orderId
+            }, true);
+            
+            return {
+                id: result.orderId,
+                symbol: result.symbol,
+                status: result.status, // NEW, PARTIALLY_FILLED, FILLED, CANCELED
+                side: result.side,
+                type: result.type,
+                price: parseFloat(result.price),
+                quantity: parseFloat(result.origQty),
+                executedQuantity: parseFloat(result.executedQty),
+                timestamp: result.time
+            };
+        } catch (error) {
+            logger.error('Binance emir sorgulama hatası:', error.message);
+            throw error;
+        }
+    }
+
+    /**
+     * Cancel order
+     */
+    async cancelOrder(symbol, orderId) {
+        try {
+            const result = await this.makeRequest('DELETE', '/api/v3/order', {
+                symbol: symbol,
+                orderId: orderId
+            }, true);
+            
+            logger.order(`✅ Binance emir iptal edildi`, {
+                orderId: result.orderId,
+                symbol: result.symbol
+            });
+            
+            return result;
+        } catch (error) {
+            logger.error('❌ Binance emir iptal hatası:', error.message);
+            throw error;
+        }
+    }
+
+    /**
+     * Get current open orders
+     */
+    async getOpenOrders(symbol = null) {
+        try {
+            const params = {};
+            if (symbol) {
+                params.symbol = symbol;
+            }
+            
+            const result = await this.makeRequest('GET', '/api/v3/openOrders', params, true);
+            
+            logger.order(`Binance açık emirler: ${result.length} adet`, {
+                symbol: symbol || 'ALL'
+            });
+            
+            return result.map(order => ({
+                id: order.orderId,
+                symbol: order.symbol,
+                side: order.side,
+                type: order.type,
+                price: parseFloat(order.price),
+                quantity: parseFloat(order.origQty),
+                executedQuantity: parseFloat(order.executedQty),
+                status: order.status,
+                timestamp: order.time
+            }));
+        } catch (error) {
+            logger.error('Binance açık emir hatası:', error.message);
+            throw error;
+        }
+    }
+
+    /**
+     * Get all orders (history)
+     */
+    async getAllOrders(symbol, params = {}) {
+        try {
+            const orderParams = {
+                symbol: symbol,
+                ...params
+            };
+            
+            const result = await this.makeRequest('GET', '/api/v3/allOrders', orderParams, true);
+            
+            return result;
+        } catch (error) {
+            logger.error('Binance emir geçmişi hatası:', error.message);
+            throw error;
+        }
+    }
+
+    /**
+     * Get account information including commission rates
+     */
+    async getAccountInfo() {
+        try {
+            const result = await this.makeRequest('GET', '/api/v3/account', {}, true);
+            
+            logger.api('Binance', 'Account info alındı', {
+                commissionRates: result.commissionRates
+            });
+            
+            return result;
+        } catch (error) {
+            logger.error('Binance account info hatası:', error.message);
+            throw error;
+        }
+    }
+
+    /**
+     * Get commission rates for a specific symbol
+     */
+    async getCommissionRates(symbol = 'XRPUSDT') {
+        try {
+            const result = await this.makeRequest('GET', '/api/v3/account/commission', { symbol }, true);
+            
+            logger.api('Binance', `${symbol} commission rates alındı`, {
+                maker: result.standardCommission.maker,
+                taker: result.standardCommission.taker
+            });
+            
+            return result;
+        } catch (error) {
+            logger.error(`Binance ${symbol} commission hatası:`, error.message);
+            throw error;
+        }
+    }
+
+    /**
+     * Helper: Sleep function
+     */
+    sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    /**
+     * WebSocket bağlantısı kur
+     * Stream: <symbol>@bookTicker - En iyi bid/ask fiyatları gerçek zamanlı
+     */
+    connectWebSocket(callback) {
+        return new Promise((resolve, reject) => {
+            const symbol = 'xrpusdt'; // Binance lowercase kullanır
+            const wsUrl = `wss://stream.binance.com:9443/ws/${symbol}@bookTicker`;
+
+            logger.api('Binance', 'WebSocket bağlantısı kuruluyor', { url: wsUrl });
+
+            this.ws = new WebSocket(wsUrl);
+            this.wsReconnectAttempts = 0;
+
+            this.ws.on('open', () => {
+                logger.info('✅ Binance WebSocket bağlandı (XRPUSDT)');
+                this.wsReconnectAttempts = 0;
+                resolve(this.ws);
+            });
+
+            this.ws.on('error', (error) => {
+                logger.error('Binance WebSocket bağlantı hatası:', error);
+                reject(error);
+            });
+
+            this.ws.on('message', (data) => {
+                try {
+                    const message = JSON.parse(data);
+                    
+                    // Binance bookTicker formatı:
+                    // {
+                    //   "u": 400900217,      // order book updateId
+                    //   "s": "XRPUSDT",      // symbol
+                    //   "b": "25.35190000",  // best bid price
+                    //   "B": "31.21000000",  // best bid qty
+                    //   "a": "25.36520000",  // best ask price
+                    //   "A": "40.66000000"   // best ask qty
+                    // }
+
+                    const priceData = {
+                        exchange: 'BINANCE',
+                        symbol: message.s,
+                        timestamp: Date.now(),
+                        bid: parseFloat(message.b),
+                        ask: parseFloat(message.a),
+                        bidQty: parseFloat(message.B),
+                        askQty: parseFloat(message.A),
+                        updateId: message.u
+                    };
+
+                    // Log her 50 güncelleme bir (spam olmasın)
+                    if (!this.wsMessageCount) this.wsMessageCount = 0;
+                    this.wsMessageCount++;
+                    
+                    if (this.wsMessageCount % 50 === 0) {
+                        logger.info('📊 Binance fiyat güncellemesi', {
+                            bid: priceData.bid,
+                            ask: priceData.ask,
+                            spread: (priceData.ask - priceData.bid).toFixed(4),
+                            count: this.wsMessageCount
+                        });
+                    }
+
+                    if (callback && typeof callback === 'function') {
+                        callback(priceData);
+                    }
+
+                } catch (error) {
+                    logger.error('Binance WebSocket mesaj parse hatası:', error);
+                }
+            });
+
+            this.ws.on('close', (code, reason) => {
+                logger.warn('❌ Binance WebSocket bağlantısı kapandı', { 
+                    code, 
+                    reason: reason.toString(),
+                    reconnectAttempt: this.wsReconnectAttempts + 1 
+                });
+                
+                // Otomatik yeniden bağlanma (max 5 deneme)
+                if (this.wsReconnectAttempts < 5) {
+                    this.wsReconnectAttempts++;
+                    const delay = 1000 * this.wsReconnectAttempts;
+                    
+                    logger.info(`🔄 Binance WebSocket ${delay}ms sonra yeniden bağlanacak...`);
+                    
+                    setTimeout(() => {
+                        this.connectWebSocket(callback);
+                    }, delay);
+                } else {
+                    logger.error('Binance WebSocket maksimum yeniden bağlanma denemesi aşıldı');
+                }
+            });
+
+            this.ws.on('ping', () => {
+                this.ws.pong();
+                // Ping-pong loglamaya gerek yok, spam olur
+            });
+        });
+    }
+
+    /**
+     * WebSocket bağlantısını kapat
+     */
+    disconnectWebSocket() {
+        if (this.ws) {
+            logger.api('Binance', 'WebSocket bağlantısı kapatılıyor');
+            this.ws.close();
+            this.ws = null;
+            this.wsReconnectAttempts = 0;
+        }
+    }
+
+    /**
+     * Bağlantıyı kapat
+     */
+    async disconnect() {
+        this.disconnectWebSocket();
+        logger.info('Binance bağlantısı kapatıldı');
+    }
+}
+
+export default BinanceClient;

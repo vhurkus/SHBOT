@@ -1,0 +1,31 @@
+{
+  "name": "shbot-arbitrage",
+  "version": "1.0.0",
+  "description": "Cross-exchange arbitrage bot for BTCTurk and Binance",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "test": "node test-phase3.js",
+    "diagnostic": "node diagnostic.js"
+  },
+  "keywords": [
+    "arbitrage",
+    "btcturk",
+    "binance",
+    "trading",
+    "bot",
+    "cryptocurrency"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.14.2",
+    "dotenv": "^16.3.1",
+    "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
