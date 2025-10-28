@@ -188,6 +188,12 @@ class ArbitrageBot {
                 error: error.message,
                 stack: error.stack
             });
+
+            // Telegram bildirimi - Initialization hatası
+            notificationService.notifyInitializationError(error.message).catch(err =>
+                logger.error('Telegram bildirimi gönderilemedi', { error: err.message })
+            );
+
             throw error;
         }
     }
@@ -274,7 +280,10 @@ class ArbitrageBot {
                     USDT: `${this.balances.binance.USDT.toFixed(2)} (${this.balances.binance.lockedUSDT.toFixed(2)} locked)`
                 }
             });
-            
+
+            // Düşük bakiye kontrolü
+            this.checkLowBalance();
+
             return this.balances;
         } catch (error) {
             logger.error('❌ Bakiye güncelleme hatası', {
@@ -334,6 +343,12 @@ class ArbitrageBot {
                 const changePercent = Math.abs((newAsk - oldPrice) / oldPrice) * 100;
                 if (changePercent > threshold) {
                     logger.warn(`[Data Validation] BTCTurk'te anormal fiyat sıçraması tespit edildi (%${changePercent.toFixed(2)}), veri atlanıyor.`, { oldPrice, newAsk, threshold });
+
+                    // Telegram bildirimi - Price anomaly (throttled)
+                    notificationService.notifyPriceAnomaly('BTCTurk', oldPrice, newAsk, changePercent).catch(err =>
+                        logger.error('Telegram bildirimi gönderilemedi', { error: err.message })
+                    );
+
                     return;
                 }
             }
@@ -371,6 +386,12 @@ class ArbitrageBot {
                 const changePercent = Math.abs((newAsk - oldPrice) / oldPrice) * 100;
                 if (changePercent > threshold) {
                     logger.warn(`[Data Validation] Binance'te anormal fiyat sıçraması tespit edildi (%${changePercent.toFixed(2)}), veri atlanıyor.`, { oldPrice, newAsk, threshold });
+
+                    // Telegram bildirimi - Price anomaly (throttled)
+                    notificationService.notifyPriceAnomaly('Binance', oldPrice, newAsk, changePercent).catch(err =>
+                        logger.error('Telegram bildirimi gönderilemedi', { error: err.message })
+                    );
+
                     return;
                 }
             }
@@ -877,6 +898,11 @@ class ArbitrageBot {
                         fillDuration: `${(fillDuration / 1000).toFixed(2)}s`
                     });
 
+                    // Telegram bildirimi - Partial fill
+                    notificationService.notifyPartialFill(txId, orderId, filledAmount, amount).catch(err =>
+                        logger.error('Telegram bildirimi gönderilemedi', { error: err.message })
+                    );
+
                     if (this.intervals.orderMonitoring) clearInterval(this.intervals.orderMonitoring);
 
                     this.currentOrder.active = false;
@@ -951,7 +977,12 @@ class ArbitrageBot {
                         originalOrderId,
                         counterOrderId: counterOrder.id,
                     });
-        
+
+                    // Telegram bildirimi - Trade başarılı (throttled)
+                    notificationService.notifyTradeSuccess(txId, profit, this.metrics.totalProfit, this.metrics).catch(err =>
+                        logger.error('Telegram bildirimi gönderilemedi', { error: err.message })
+                    );
+
                     setTimeout(() => this.checkArbitrageOpportunity(), 2000);
                     return true;
         
@@ -1011,8 +1042,26 @@ class ArbitrageBot {
                 });
             }
         }, this.config.balanceUpdateInterval);
-        
+
+        // Günlük rapor interval (her gece saat 00:00'da)
+        const now = new Date();
+        const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 0);
+        const msUntilMidnight = midnight - now;
+
+        setTimeout(() => {
+            // İlk rapor
+            this.sendDailyReportIfNeeded();
+            // Sonraki raporlar için 24 saatlik interval
+            setInterval(() => this.sendDailyReportIfNeeded(), 24 * 60 * 60 * 1000);
+        }, msUntilMidnight);
+
         this.isRunning = true;
+
+        // Telegram bildirimi - Bot başladı
+        notificationService.notifyBotStarted(this.balances).catch(err =>
+            logger.error('Telegram bildirimi gönderilemedi', { error: err.message })
+        );
+
         logger.info('✅ Bot çalışıyor! Sürekli açık emir stratejisi aktif.');
         logger.info('ℹ️  Fiyat değişimi eşiği: %' + this.config.priceUpdateThreshold);
     }
@@ -1047,8 +1096,14 @@ class ArbitrageBot {
         if (this.binance) {
             this.binance.disconnectWebSocket();
         }
-        
+
         this.isRunning = false;
+
+        // Telegram bildirimi - Bot durdu
+        notificationService.notifyBotStopped(this.metrics, this.balances).catch(err =>
+            logger.error('Telegram bildirimi gönderilemedi', { error: err.message })
+        );
+
         logger.info('✅ Bot durduruldu');
     }
     
@@ -1071,7 +1126,7 @@ class ArbitrageBot {
      */
     printStatus() {
         const status = this.getStatus();
-        
+
         console.log('\n' + '='.repeat(80));
         console.log('🤖 ARBITRAGE BOT STATUS');
         console.log('='.repeat(80));
@@ -1085,6 +1140,60 @@ class ArbitrageBot {
         console.log(`  Binance: BID ${status.prices.binance.bid || 'N/A'} / ASK ${status.prices.binance.ask || 'N/A'}`);
         console.log(`\n📋 Aktif Emir: ${status.currentOrder.active ? `✅ ${status.currentOrder.exchange} - ${status.currentOrder.side}` : '❌ YOK'}`);
         console.log('\n' + '='.repeat(80) + '\n');
+    }
+
+    /**
+     * Günlük rapor gönder (gece 00:00'da)
+     */
+    async sendDailyReportIfNeeded() {
+        try {
+            // Gün başındaki bakiyeleri saklamak için (ilk çalıştırmada mevcut bakiye kullanılır)
+            if (!this.startOfDayBalances) {
+                this.startOfDayBalances = JSON.parse(JSON.stringify(this.balances));
+            }
+
+            await notificationService.sendDailyReport(this.metrics, this.balances, this.startOfDayBalances);
+
+            // Bir sonraki gün için bakiyeleri sıfırla
+            this.startOfDayBalances = JSON.parse(JSON.stringify(this.balances));
+        } catch (error) {
+            logger.error('Günlük rapor gönderilemedi', { error: error.message });
+        }
+    }
+
+    /**
+     * Düşük bakiye kontrolü
+     */
+    checkLowBalance() {
+        const minBalances = config.trading.safety.minBalance;
+
+        // BTCTurk XRP kontrolü
+        if (this.balances.btcturk.totalXRP < minBalances.xrp) {
+            notificationService.notifyLowBalance('BTCTurk', 'XRP', this.balances.btcturk.totalXRP, minBalances.xrp).catch(err =>
+                logger.error('Telegram bildirimi gönderilemedi', { error: err.message })
+            );
+        }
+
+        // BTCTurk USDT kontrolü
+        if (this.balances.btcturk.totalUSDT < minBalances.usdt) {
+            notificationService.notifyLowBalance('BTCTurk', 'USDT', this.balances.btcturk.totalUSDT, minBalances.usdt).catch(err =>
+                logger.error('Telegram bildirimi gönderilemedi', { error: err.message })
+            );
+        }
+
+        // Binance XRP kontrolü
+        if (this.balances.binance.totalXRP < minBalances.xrp) {
+            notificationService.notifyLowBalance('Binance', 'XRP', this.balances.binance.totalXRP, minBalances.xrp).catch(err =>
+                logger.error('Telegram bildirimi gönderilemedi', { error: err.message })
+            );
+        }
+
+        // Binance USDT kontrolü
+        if (this.balances.binance.totalUSDT < minBalances.usdt) {
+            notificationService.notifyLowBalance('Binance', 'USDT', this.balances.binance.totalUSDT, minBalances.usdt).catch(err =>
+                logger.error('Telegram bildirimi gönderilemedi', { error: err.message })
+            );
+        }
     }
 }
 
