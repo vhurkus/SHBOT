@@ -21,9 +21,10 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "ws": "^8.14.2",
     "dotenv": "^16.3.1",
-    "winston": "^3.11.0"
+    "node-telegram-bot-api": "^0.66.0",
+    "winston": "^3.11.0",
+    "ws": "^8.14.2"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"

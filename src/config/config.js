@@ -79,7 +79,8 @@ const config = {
         rateLimit: {
             maxRequests: getInt('BTCTURK_RATE_LIMIT', 10), // per second
             retryDelay: getInt('BTCTURK_RETRY_DELAY', 1000), // ms
-            maxRetries: getInt('BTCTURK_MAX_RETRIES', 3)
+            maxRetries: getInt('BTCTURK_MAX_RETRIES', 3),
+            enableRetry: getBoolean('BTCTURK_ENABLE_RETRY', true)
         }
     },
 
@@ -140,6 +141,7 @@ const config = {
         
         // Güvenlik limitleri
         safety: {
+            priceSanityCheckThreshold: getFloat('PRICE_SANITY_CHECK_THRESHOLD', 25), // %25, ani fiyat sıçramalarını engellemek için
             maxDailyTrades: getInt('MAX_DAILY_TRADES', 100),
             maxDailyLoss: getFloat('MAX_DAILY_LOSS', 100), // USDT cinsinden
             minBalance: {

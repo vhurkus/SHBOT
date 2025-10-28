@@ -20,20 +20,25 @@ class BinanceClient {
         this.lastRequestTime = 0;
         this.minRequestInterval = 50; // 1200 req/min = ~50ms interval
 
-        // ✅ DÜZELTME: Server time senkronizasyonu
-        this.serverTimeOffset = 0; // Local time - Server time
+        this.serverTimeOffset = 0;
         this.lastTimeSyncTime = 0;
-        this.timeSyncInterval = 60000; // 60 saniye
+        this.timeSyncInterval = 60000;
 
-        // WebSocket için
+        // Task 4.3: WebSocket Robustness
         this.ws = null;
-        this.wsReconnectAttempts = 0;
+        this.priceCallback = null;
+        this.isManualClose = false;
+        this.reconnectAttempts = 0;
+        this.maxReconnectAttempts = config.websocket?.maxReconnectAttempts || 10;
+        this.initialReconnectDelay = config.websocket?.reconnectDelay || 5000;
+        this.lastMessageTimestamp = null;
+        this.healthCheckInterval = null;
+        this.staleConnectionThreshold = 60000; // 60 saniye
 
-        // XRPUSDT precision cache (from /exchangeInfo)
         this.xrpPrecision = {
-            stepSize: 0.1,        // LOT_SIZE filter - XRPUSDT quantity must be multiple of 0.1
-            minQty: 0.1,          // Minimum quantity
-            maxQty: 9222449.0,    // Maximum quantity
+            stepSize: 0.1,
+            minQty: 0.1,
+            maxQty: 9222449.0,
             lastUpdate: null
         };
     }
@@ -151,78 +156,105 @@ class BinanceClient {
      * Execute HTTP request with native HTTPS
      */
     async executeRequest(method, endpoint, params = {}, signed = false) {
-        try {
-            // Signed endpoint için signature ekle
-            if (signed) {
-                params.timestamp = await this.getTimestamp(); // ✅ await eklendi
-                params.recvWindow = 10000; // ✅ 10 saniye window (timestamp tolerance)
-                const queryString = this.buildQueryString(params);
-                const signature = this.generateSignature(queryString);
-                params.signature = signature;
-            }
+        // Config'den ayarları al
+        const enableRetry = this.rateLimit?.enableRetry ?? true;
+        const maxRetries = this.rateLimit?.maxRetries || 3;
+        const initialDelay = this.rateLimit?.retryDelay || 1000;
 
-            const queryString = this.buildQueryString(params);
-            const url = new URL(`${this.baseURL}${endpoint}?${queryString}`);
-
-            const options = {
-                hostname: url.hostname,
-                path: url.pathname + url.search,
-                method: method,
-                headers: {
-                    'X-MBX-APIKEY': this.apiKey,
-                    'Content-Type': 'application/json'
-                }
-            };
-
-            return new Promise((resolve, reject) => {
-                const req = https.request(options, (res) => {
-                    let data = '';
-
-                    res.on('data', (chunk) => {
-                        data += chunk;
-                    });
-
-                    res.on('end', () => {
-                        try {
-                            const jsonData = JSON.parse(data);
-                            
-                            if (res.statusCode >= 200 && res.statusCode < 300) {
-                                logger.api(`Binance ${method} ${endpoint}`, {
-                                    status: res.statusCode
-                                });
-                                resolve(jsonData);
-                            } else {
-                                logger.error(`Binance API Error: ${method} ${endpoint}`, {
-                                    status: res.statusCode,
-                                    message: jsonData.msg || jsonData.message,
-                                    code: jsonData.code
-                                });
-                                const error = new Error(`Request failed with status code ${res.statusCode}`);
-                                error.response = { data: jsonData, status: res.statusCode };
-                                reject(error);
-                            }
-                        } catch (parseError) {
-                            reject(new Error(`Failed to parse response: ${data}`));
-                        }
-                    });
-                });
-
-                req.on('error', (error) => {
-                    logger.error('Binance request error:', error.message);
-                    reject(error);
-                });
-
-                req.end();
-            });
-
-        } catch (error) {
-            logger.error(`Binance API Error: ${method} ${endpoint}`, {
-                status: error.response?.status,
-                message: error.response?.data?.msg || error.message,
-                code: error.response?.data?.code
-            });
-            throw error;
+        // Eğer yeniden deneme mekanizması aktif değilse, direkt isteği yap
+        if (!enableRetry) {
+            return this.performRequest(method, endpoint, params, signed);
         }
+
+        // Yeniden deneme mekanizması aktifse, döngü içinde isteği yap
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                return await this.performRequest(method, endpoint, params, signed, attempt > 0);
+            } catch (error) {
+                const isRateLimitError = error.response?.status === 429 || error.response?.status === 418 || error.response?.data?.code === -1003;
+                const isTimeoutError = error.code === 'ETIMEDOUT';
+                const isNetworkError = error.code === 'ECONNRESET' || error.code === 'ENOTFOUND';
+
+                if ((isRateLimitError || isTimeoutError || isNetworkError) && attempt < maxRetries) {
+                    const delay = initialDelay * (2 ** attempt);
+                    let reason = 'Binance API request failed';
+                    if (isTimeoutError) reason = 'Binance connection timed out';
+                    if (isRateLimitError) reason = 'Binance rate limit hit';
+                    if (isNetworkError) reason = 'Binance network error';
+
+                    logger.warn(`${reason} (Attempt ${attempt + 1}/${maxRetries}). Retrying in ${delay}ms...`, {
+                        error: error.message,
+                        code: error.response?.data?.code,
+                        status: error.response?.status
+                    });
+                    await this.sleep(delay);
+                    continue; // Retry
+                }
+
+                logger.error(`Binance API Error after all retries: ${method} ${endpoint}`, {
+                    status: error.response?.status,
+                    message: error.response?.data?.msg || error.message,
+                    code: error.response?.data?.code
+                });
+                throw error;
+            }
+        }
+    }
+
+    /**
+     * Gerçek HTTP isteğini yapan özel metod
+     */
+    async performRequest(method, endpoint, params = {}, signed = false, isRetry = false) {
+        const startTime = Date.now(); // Performans ölçümü için başlangıç zamanı
+        if (signed) {
+            params.timestamp = await this.getTimestamp();
+            params.recvWindow = 10000;
+            const queryString = this.buildQueryString(params);
+            const signature = this.generateSignature(queryString);
+            params.signature = signature;
+        }
+
+        const queryString = this.buildQueryString(params);
+        const url = new URL(`${this.baseURL}${endpoint}?${queryString}`);
+
+        const options = {
+            hostname: url.hostname,
+            path: url.pathname + url.search,
+            method: method,
+            headers: {
+                'X-MBX-APIKEY': this.apiKey,
+                'Content-Type': 'application/json'
+            }
+        };
+
+        return new Promise((resolve, reject) => {
+            const req = https.request(options, (res) => {
+                let data = '';
+                res.on('data', (chunk) => { data += chunk; });
+                res.on('end', () => {
+                    try {
+                        const duration = Date.now() - startTime; // Performans ölçümü için bitiş
+                        const jsonData = JSON.parse(data);
+                        if (res.statusCode >= 200 && res.statusCode < 300) {
+                            if (!isRetry) logger.api(`Binance ${method} ${endpoint}`, { status: res.statusCode, duration: `${duration}ms` });
+                            resolve(jsonData);
+                        } else {
+                            const error = new Error(`Request failed with status code ${res.statusCode}: ${jsonData.msg}`);
+                            error.response = { data: jsonData, status: res.statusCode };
+                            reject(error);
+                        }
+                    } catch (parseError) {
+                        reject(new Error(`Failed to parse response: ${data}`));
+                    }
+                });
+            });
+
+            req.on('error', (error) => {
+                reject(error);
+            });
+
+            req.end();
+        });
     }
 
     /**
@@ -279,6 +311,12 @@ class BinanceClient {
                     const free = parseFloat(item.free);
                     const locked = parseFloat(item.locked);
                     
+                    // Task 4.5: Balance Data Validation
+                    if (isNaN(free) || isNaN(locked) || free < 0 || locked < 0) {
+                        logger.warn(`[Data Validation] Binance'ten geçersiz bakiye verisi geldi, atlanıyor.`, { asset: item.asset, free: item.free, locked: item.locked });
+                        return; // Bu varlığı atla
+                    }
+
                     if (free > 0 || locked > 0) {
                         balances[item.asset] = {
                             free: free,
@@ -429,19 +467,33 @@ class BinanceClient {
                 orderId: orderId
             }, true);
             
+            const price = parseFloat(result.price);
+            const quantity = parseFloat(result.origQty);
+            const executedQuantity = parseFloat(result.executedQty);
+
+            // Task 4.5: Order Data Validation
+            if (isNaN(price) || isNaN(quantity) || isNaN(executedQuantity) || price < 0 || quantity < 0 || executedQuantity < 0) {
+                logger.error(`[Data Validation] Binance'ten geçersiz emir verisi geldi.`, { orderId, data: result });
+                throw new Error('Invalid order data received from Binance');
+            }
+            
             return {
                 id: result.orderId,
                 symbol: result.symbol,
-                status: result.status, // NEW, PARTIALLY_FILLED, FILLED, CANCELED
+                status: result.status,
                 side: result.side,
                 type: result.type,
-                price: parseFloat(result.price),
-                quantity: parseFloat(result.origQty),
-                executedQuantity: parseFloat(result.executedQty),
+                price: price,
+                quantity: quantity,
+                executedQuantity: executedQuantity,
                 timestamp: result.time
             };
         } catch (error) {
-            logger.error('Binance emir sorgulama hatası:', error.message);
+            // Binance: -2013, Order does not exist.
+            if (error.response?.data?.code === -2013) {
+                throw new Error('Order not found');
+            }
+            logger.error('Binance emir sorgulama hatası:', { orderId, error: error.message });
             throw error;
         }
     }
@@ -569,40 +621,32 @@ class BinanceClient {
      * Stream: <symbol>@bookTicker - En iyi bid/ask fiyatları gerçek zamanlı
      */
     connectWebSocket(callback) {
+        this.priceCallback = callback;
+        this.isManualClose = false;
+        const symbol = 'xrpusdt';
+        const wsUrl = `wss://stream.binance.com:9443/ws/${symbol}@bookTicker`;
+
         return new Promise((resolve, reject) => {
-            const symbol = 'xrpusdt'; // Binance lowercase kullanır
-            const wsUrl = `wss://stream.binance.com:9443/ws/${symbol}@bookTicker`;
-
             logger.api('Binance', 'WebSocket bağlantısı kuruluyor', { url: wsUrl });
-
             this.ws = new WebSocket(wsUrl);
-            this.wsReconnectAttempts = 0;
 
             this.ws.on('open', () => {
                 logger.info('✅ Binance WebSocket bağlandı (XRPUSDT)');
-                this.wsReconnectAttempts = 0;
+                this.reconnectAttempts = 0;
+                this.lastMessageTimestamp = Date.now();
+                this.startHealthCheck();
                 resolve(this.ws);
             });
 
             this.ws.on('error', (error) => {
                 logger.error('Binance WebSocket bağlantı hatası:', error);
-                reject(error);
+                reject(error); // Let promise fail on initial connection error
             });
 
             this.ws.on('message', (data) => {
+                this.lastMessageTimestamp = Date.now();
                 try {
                     const message = JSON.parse(data);
-                    
-                    // Binance bookTicker formatı:
-                    // {
-                    //   "u": 400900217,      // order book updateId
-                    //   "s": "XRPUSDT",      // symbol
-                    //   "b": "25.35190000",  // best bid price
-                    //   "B": "31.21000000",  // best bid qty
-                    //   "a": "25.36520000",  // best ask price
-                    //   "A": "40.66000000"   // best ask qty
-                    // }
-
                     const priceData = {
                         exchange: 'BINANCE',
                         symbol: message.s,
@@ -613,67 +657,61 @@ class BinanceClient {
                         askQty: parseFloat(message.A),
                         updateId: message.u
                     };
-
-                    // Log her 50 güncelleme bir (spam olmasın)
-                    if (!this.wsMessageCount) this.wsMessageCount = 0;
-                    this.wsMessageCount++;
-                    
-                    if (this.wsMessageCount % 50 === 0) {
-                        logger.info('📊 Binance fiyat güncellemesi', {
-                            bid: priceData.bid,
-                            ask: priceData.ask,
-                            spread: (priceData.ask - priceData.bid).toFixed(4),
-                            count: this.wsMessageCount
-                        });
-                    }
-
-                    if (callback && typeof callback === 'function') {
-                        callback(priceData);
-                    }
-
+                    if (this.priceCallback) this.priceCallback(priceData);
                 } catch (error) {
                     logger.error('Binance WebSocket mesaj parse hatası:', error);
                 }
             });
 
             this.ws.on('close', (code, reason) => {
-                logger.warn('❌ Binance WebSocket bağlantısı kapandı', { 
-                    code, 
-                    reason: reason.toString(),
-                    reconnectAttempt: this.wsReconnectAttempts + 1 
-                });
-                
-                // Otomatik yeniden bağlanma (max 5 deneme)
-                if (this.wsReconnectAttempts < 5) {
-                    this.wsReconnectAttempts++;
-                    const delay = 1000 * this.wsReconnectAttempts;
-                    
-                    logger.info(`🔄 Binance WebSocket ${delay}ms sonra yeniden bağlanacak...`);
-                    
-                    setTimeout(() => {
-                        this.connectWebSocket(callback);
-                    }, delay);
-                } else {
-                    logger.error('Binance WebSocket maksimum yeniden bağlanma denemesi aşıldı');
+                logger.warn('❌ Binance WebSocket bağlantısı kapandı', { code, reason: reason.toString() });
+                if (!this.isManualClose) {
+                    this.reconnect();
                 }
-            });
-
-            this.ws.on('ping', () => {
-                this.ws.pong();
-                // Ping-pong loglamaya gerek yok, spam olur
             });
         });
     }
 
-    /**
-     * WebSocket bağlantısını kapat
-     */
+    startHealthCheck() {
+        this.clearTimers();
+        this.healthCheckInterval = setInterval(() => {
+            if (Date.now() - this.lastMessageTimestamp > this.staleConnectionThreshold) {
+                logger.warn('Binance WebSocket stale connection detected. Forcing reconnect.');
+                if (this.ws) this.ws.terminate();
+            }
+        }, 15000);
+    }
+
+    reconnect() {
+        this.clearTimers();
+        if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+            logger.error('Binance WebSocket max reconnect attempts reached. Giving up.');
+            return;
+        }
+
+        const delay = this.initialReconnectDelay * (2 ** this.reconnectAttempts);
+        this.reconnectAttempts++;
+
+        setTimeout(() => {
+            logger.info(`🔄 Binance WebSocket ${delay}ms sonra yeniden bağlanacak... (Deneme: ${this.reconnectAttempts})`);
+            this.connectWebSocket(this.priceCallback);
+        }, delay);
+    }
+
     disconnectWebSocket() {
+        this.isManualClose = true;
+        this.clearTimers();
         if (this.ws) {
             logger.api('Binance', 'WebSocket bağlantısı kapatılıyor');
             this.ws.close();
             this.ws = null;
-            this.wsReconnectAttempts = 0;
+        }
+    }
+
+    clearTimers() {
+        if (this.healthCheckInterval) {
+            clearInterval(this.healthCheckInterval);
+            this.healthCheckInterval = null;
         }
     }
 

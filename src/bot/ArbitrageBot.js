@@ -9,6 +9,7 @@ import BTCTurkClient from '../exchanges/BTCTurkClient.js';
 import BinanceClient from '../exchanges/BinanceClient.js';
 import ArbitrageEngine from './ArbitrageEngine.js';
 import { roundToBinanceLOT_SIZE, roundToBTCTurkScale } from '../utils/precision.js';
+import notificationService from '../utils/NotificationService.js';
 
 class ArbitrageBot {
     constructor(options = {}, clients = {}) {
@@ -62,15 +63,24 @@ class ArbitrageBot {
         // Aktif emir state
         this.currentOrder = {
             active: false,
-            exchange: null,      // 'btcturk' veya 'binance'
+            txId: null,          // Task 5.1: Transaction ID
+            exchange: null,
             orderId: null,
-            side: null,          // 'BUY' veya 'SELL'
+            side: null,
             price: null,
             amount: null,
-            scenario: null,      // 'SELL' veya 'BUY'
+            scenario: null,
             timestamp: null,
-            lastOrderPrice: null,     // Emir oluşturulduğundaki BTCTurk fiyatı
-            lastBinancePrice: null    // Emir oluşturulduğundaki Binance fiyatı
+            expectedProfit: null, // Task 5.2: Beklenen kar
+            lastBinancePrice: null
+        };
+
+        // Task 5.2: Performance Metrics
+        this.metrics = {
+            totalProfit: 0,
+            tradesSucceeded: 0,
+            tradesFailed: 0,
+            startTime: Date.now()
         };
         
         // Emir güncelleme lock flag (race condition önleme)
@@ -305,52 +315,80 @@ class ArbitrageBot {
     /**
      * BTCTurk fiyat güncellemesi callback
      */
-    onBTCTurkPriceUpdate(data) {
-        this.prices.btcturk = {
-            bid: parseFloat(data.bid),
-            ask: parseFloat(data.ask),
-            last: parseFloat(data.last),
-            timestamp: Date.now()
-        };
-        
-        // Fiyat değişimi kontrolü ve potansiyel arbitraj analizi
-        this.checkArbitrageOpportunity();
-    }
+        onBTCTurkPriceUpdate(data) {
+            const newBid = parseFloat(data.bid);
+            const newAsk = parseFloat(data.ask);
     
-    /**
-     * Binance fiyat güncellemesi callback
-     */
-    onBinancePriceUpdate(data) {
-        this.prices.binance = {
-            bid: parseFloat(data.bid || data.bestBid),
-            ask: parseFloat(data.ask || data.bestAsk),
-            last: parseFloat(data.ask || data.bestAsk), // Binance bookTicker'da last yok
-            timestamp: Date.now()
-        };
-        
-        // Debug: Her 500 güncellemede bir log (spam olmasın)
-        if (!this.binancePriceUpdateCount) this.binancePriceUpdateCount = 0;
-        this.binancePriceUpdateCount++;
-        
-        if (this.binancePriceUpdateCount % 500 === 0) {
-            logger.info('💰 onBinancePriceUpdate çağrıldı', {
-                bid: this.prices.binance.bid,
-                ask: this.prices.binance.ask,
-                count: this.binancePriceUpdateCount,
-                hasActiveOrder: this.currentOrder.active,
-                lastBinancePrice: this.currentOrder.lastBinancePrice
-            });
-        }
-        
-        // Açık emir varsa fiyat değişimini kontrol et
-        if (this.currentOrder.active && this.currentOrder.lastBinancePrice) {
-            this.checkPriceChange();
-        }
-        
-        // Fiyat değişimi kontrolü ve potansiyel arbitraj analizi
-        this.checkArbitrageOpportunity();
-    }
+            // --- DATA VALIDATION (Task 4.5) ---
+            if (isNaN(newBid) || isNaN(newAsk) || newBid <= 0 || newAsk <= 0) {
+                logger.warn(`[Data Validation] BTCTurk'ten geçersiz fiyat verisi geldi (0 veya sayı değil), atlanıyor.`, { bid: data.bid, ask: data.ask });
+                return;
+            }
+            if (newBid > newAsk) {
+                logger.warn(`[Data Validation] BTCTurk'ten geçersiz fiyat verisi geldi (bid > ask), atlanıyor.`, { bid: newBid, ask: newAsk });
+                return;
+            }
+            const threshold = this.config.trading.safety.priceSanityCheckThreshold;
+            const oldPrice = this.prices.btcturk.ask;
+            if (oldPrice && threshold > 0) {
+                const changePercent = Math.abs((newAsk - oldPrice) / oldPrice) * 100;
+                if (changePercent > threshold) {
+                    logger.warn(`[Data Validation] BTCTurk'te anormal fiyat sıçraması tespit edildi (%${changePercent.toFixed(2)}), veri atlanıyor.`, { oldPrice, newAsk, threshold });
+                    return;
+                }
+            }
+            // --- END VALIDATION ---
     
+            this.prices.btcturk = {
+                bid: newBid,
+                ask: newAsk,
+                last: parseFloat(data.last),
+                timestamp: Date.now()
+            };
+            
+            this.checkArbitrageOpportunity();
+        }
+    
+        /**
+         * Binance fiyat güncellemesi callback
+         */
+        onBinancePriceUpdate(data) {
+            const newBid = parseFloat(data.bid || data.bestBid);
+            const newAsk = parseFloat(data.ask || data.bestAsk);
+    
+            // --- DATA VALIDATION (Task 4.5) ---
+            if (isNaN(newBid) || isNaN(newAsk) || newBid <= 0 || newAsk <= 0) {
+                logger.warn(`[Data Validation] Binance'ten geçersiz fiyat verisi geldi (0 veya sayı değil), atlanıyor.`, { bid: data.bid, ask: data.ask });
+                return;
+            }
+            if (newBid > newAsk) {
+                logger.warn(`[Data Validation] Binance'ten geçersiz fiyat verisi geldi (bid > ask), atlanıyor.`, { bid: newBid, ask: newAsk });
+                return;
+            }
+            const threshold = this.config.trading.safety.priceSanityCheckThreshold;
+            const oldPrice = this.prices.binance.ask;
+            if (oldPrice && threshold > 0) {
+                const changePercent = Math.abs((newAsk - oldPrice) / oldPrice) * 100;
+                if (changePercent > threshold) {
+                    logger.warn(`[Data Validation] Binance'te anormal fiyat sıçraması tespit edildi (%${changePercent.toFixed(2)}), veri atlanıyor.`, { oldPrice, newAsk, threshold });
+                    return;
+                }
+            }
+            // --- END VALIDATION ---
+    
+            this.prices.binance = {
+                bid: newBid,
+                ask: newAsk,
+                last: newAsk, // Binance bookTicker'da last yok
+                timestamp: Date.now()
+            };
+            
+            if (this.currentOrder.active && this.currentOrder.lastBinancePrice) {
+                this.checkPriceChange();
+            }
+            
+            this.checkArbitrageOpportunity();
+        }    
     /**
      * Fiyat değişimini kontrol et ve gerekirse emri güncelle
      * Sürekli açık emir stratejisi için kritik metod
@@ -699,201 +737,52 @@ class ArbitrageBot {
      * - Hazırlık gerekiyorsa önce hazırlık işlemi yapılır
      */
     async createNewOrder() {
+        let scenario = null;
+        let txId = null; // Task 5.1: Transaction ID
         try {
-            logger.info('📝 Yeni emir oluşturma başlıyor...');
+            // Task 5.1: Yeni bir işlem döngüsü için yeni bir ID oluştur
+            txId = `TX_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+            logger.info('📝 Yeni emir oluşturma başlıyor...', { txId });
 
-            // ============================================================================
-            // 1. PRE-CHECKS
-            // ============================================================================
-
-            // Aktif emir var mı kontrol
             if (this.currentOrder.active) {
-                logger.warn('⚠️  Zaten aktif emir var, yeni emir oluşturulmayacak', {
-                    orderId: this.currentOrder.orderId,
-                    side: this.currentOrder.side
-                });
+                logger.warn('⚠️  Zaten aktif emir var, yeni emir oluşturulmayacak', { txId });
                 return false;
             }
-
-            // Fiyatlar mevcut mu kontrol
             if (!this.prices.btcturk.bid || !this.prices.binance.bid) {
-                logger.warn('⚠️  Fiyat bilgisi eksik, emir oluşturulamıyor');
+                logger.warn('⚠️  Fiyat bilgisi eksik, emir oluşturulamıyor', { txId });
                 return false;
             }
 
-            // ============================================================================
-            // 2. SENARYO BELİRLEME (✅ YENİ - Bakiye Bazlı!)
-            // ============================================================================
-            // Market Maker Mode: Bakiyelere göre senaryo belirle
-            // XRP nerede ise o tarafa göre emir aç
-
-            logger.info('🔍 Bakiye bazlı senaryo belirleniyor...');
-
-            const balances = {
-                btcturk: {
-                    XRP: this.balances.btcturk.XRP,
-                    USDT: this.balances.btcturk.USDT
-                },
-                binance: {
-                    XRP: this.balances.binance.XRP,
-                    USDT: this.balances.binance.USDT
-                }
-            };
-
-            const scenarioInfo = this.engine.determineScenario(balances, this.prices);
-
-            // Senaryo belirlenemedi mi?
+            logger.info('🔍 Bakiye bazlı senaryo belirleniyor...', { txId });
+            const scenarioInfo = this.engine.determineScenario(this.balances, this.prices);
             if (!scenarioInfo.scenario) {
-                logger.warn('❌ Senaryo belirlenemedi', {
-                    reason: scenarioInfo.reason,
-                    balances: scenarioInfo.balances
+                logger.warn('❌ Senaryo belirlenemedi', { txId, reason: scenarioInfo.reason });
+                return false;
+            }
+            scenario = scenarioInfo.scenario;
+
+            logger.info(`[Task 4.4] Proaktif bakiye kontrolü yapılıyor (${scenario} senaryosu)...`, { txId });
+            const balanceValidation = this.engine.validateBalance(this.balances, scenario, this.prices);
+            if (!balanceValidation.valid) {
+                logger.warn('⚠️  Yetersiz bakiye nedeniyle emir oluşturulamadı (proaktif kontrol)', {
+                    txId,
+                    reason: balanceValidation.reason,
+                    details: balanceValidation.checks
                 });
                 return false;
             }
 
-            logger.info('📊 Senaryo belirlendi:', {
-                scenario: scenarioInfo.scenario,
-                btcturkSide: scenarioInfo.btcturkSide,
-                binanceSide: scenarioInfo.binanceSide,
-                needsPreparation: scenarioInfo.needsPreparation ? '⚠️ Evet' : '✅ Hayır',
-                reason: scenarioInfo.reason
-            });
-
-            // Hazırlık gerekiyor mu?
-            if (scenarioInfo.needsPreparation) {
-                if (!scenarioInfo.canPrepare) {
-                    logger.warn('❌ Hazırlık yapılamıyor', {
-                        reason: scenarioInfo.reason,
-                        requiredUSDT: scenarioInfo.requiredUSDT,
-                        availableUSDT: scenarioInfo.availableUSDT
-                    });
-                    return false;
-                }
-
-                // Hazırlık işlemini yap
-                logger.info('🔧 Hazırlık işlemi gerekiyor...', scenarioInfo.preparationDetails);
-                const preparationSuccess = await this.executePreparationTrade(scenarioInfo);
-
-                if (!preparationSuccess) {
-                    logger.error('❌ Hazırlık işlemi başarısız, emir açılamıyor');
-                    return false;
-                }
-
-                logger.info('✅ Hazırlık tamamlandı, şimdi limit emir açılabilir');
-
-                // Bakiyeleri güncelle (hazırlık sonrası)
-                await this.updateBalances();
-            }
-
-            const scenario = scenarioInfo.scenario;
-
-            // ============================================================================
-            // 3. KARLILIK ANALİZİ (Bilgilendirme)
-            // ============================================================================
-
-            logger.info('🔍 Karlılık analizi yapılıyor (bilgilendirme için)...');
-
-            const profitability = this.engine.calculateProfitability({
-                btcturkBid: this.prices.btcturk.bid,
-                btcturkAsk: this.prices.btcturk.ask,
-                binanceBid: this.prices.binance.bid,
-                binanceAsk: this.prices.binance.ask
-            });
-
+            const profitability = this.engine.calculateProfitability(this.prices);
             const profitScenario = scenario === 'SELL' ? profitability.sellScenario : profitability.buyScenario;
+            logger.info('📊 Piyasa durumu:', { txId, scenario, profitPercent: profitScenario.profit.percent.toFixed(2) + '%' });
 
-            logger.info('📊 Piyasa durumu:', {
-                scenario: scenario,
-                profit: profitScenario.profit.amount.toFixed(4) + ' USDT',
-                profitPercent: profitScenario.profit.percent.toFixed(2) + '%',
-                spread: profitScenario.profit.spread.toFixed(2) + '%',
-                meetsMinProfit: profitScenario.meetsMinProfit ? '✅' : '❌',
-                meetsMinSpread: profitScenario.meetsMinSpread ? '✅' : '❌'
-            });
-
-            // ============================================================================
-            // SPREAD KONTROLÜ (Kullanıcı isteğiyle değiştirildi)
-            // ============================================================================
-            // Strateji gereği, spread negatif olsa bile karlı fiyattan emir açıp bekliyoruz.
-            // Bu yüzden negatif spread kontrolü kaldırıldı. Emir her zaman açılmayı deneyecek.
-
-            // Market Maker Mode: Her zaman emir açmayı dene
-            logger.info('✅ Market maker mode: Emir açma denemesi yapılıyor...', {
-                spread: profitScenario.profit.spread.toFixed(2) + '%',
-                note: 'Spread negatif olsa bile karlı fiyattan emir açılacak.'
-            });
-
-            // ============================================================================
-            // 4. EMİR FİYATI HESAPLAMA (✅ YENİ - Engine kullanımı!)
-            // ============================================================================
-
-            logger.info('💰 Emir fiyatı hesaplanıyor (engine ile)...');
-
-            const pricing = this.engine.calculateOrderPrice({
-                btcturkBid: this.prices.btcturk.bid,
-                btcturkAsk: this.prices.btcturk.ask,
-                binanceBid: this.prices.binance.bid,
-                binanceAsk: this.prices.binance.ask
-            }, scenario, this.config.minProfit, 0); // PHASE 1: spreadBuffer kaldırıldı (0)
-
+            logger.info('💰 Emir fiyatı hesaplanıyor...', { txId });
+            const pricing = this.engine.calculateOrderPrice(this.prices, scenario, this.config.minProfit);
             const orderPrice = pricing.orderPrice;
-            const orderAmount = roundToBTCTurkScale(this.config.tradeAmount, 4); // BTCTurk XRPUSDT numeratorScale: 4
+            const orderAmount = roundToBTCTurkScale(this.config.tradeAmount, 4);
             const btcturkSide = scenario === 'SELL' ? 'sell' : 'buy';
 
-            logger.info('🎯 Emir detayları hazır', {
-                exchange: 'BTCTurk',
-                side: btcturkSide.toUpperCase(),
-                price: orderPrice,
-                amount: orderAmount,
-                total: (orderPrice * orderAmount).toFixed(2) + ' USDT',
-                expectedProfit: profitScenario.profit.amount.toFixed(4) + ' USDT',
-                profitPercent: profitScenario.profit.percent.toFixed(2) + '%',
-                breakdown: pricing.breakdown
-            });
-
-            // ============================================================================
-            // 5. DRY-RUN KONTROLÜ (✅ YENİ - Test modu!)
-            // ============================================================================
-
-            if (config.advanced.dryRun) {
-                logger.info('🧪 DRY-RUN MODE: Emir simüle ediliyor (gerçek emir gönderilmiyor)', {
-                    exchange: 'BTCTurk',
-                    side: btcturkSide.toUpperCase(),
-                    price: orderPrice,
-                    amount: orderAmount,
-                    scenario: scenario,
-                    expectedProfit: profitScenario.profit.amount.toFixed(4) + ' USDT'
-                });
-
-                // Fake order response (simülasyon için)
-                this.currentOrder = {
-                    active: true,
-                    exchange: 'btcturk',
-                    orderId: `DRY_RUN_${Date.now()}`,
-                    side: btcturkSide.toUpperCase(),
-                    price: orderPrice,
-                    amount: orderAmount,
-                    scenario: scenario,
-                    timestamp: Date.now(),
-                    lastOrderPrice: orderPrice,
-                    lastBinancePrice: scenario === 'SELL' ? this.prices.binance.ask : this.prices.binance.bid,
-                    isDryRun: true  // DRY-RUN flag
-                };
-
-                logger.info('✅ DRY-RUN: Emir simüle edildi (ID: ' + this.currentOrder.orderId + ')');
-
-                // Monitoring başlatma (dry-run için de)
-                this.startOrderMonitoring();
-
-                return true;
-            }
-
-            // ============================================================================
-            // 6. GERÇEK EMİR GÖNDERME (Production)
-            // ============================================================================
-
-            logger.info('📤 BTCTurk\'e limit emir gönderiliyor...');
-
+            logger.info('📤 BTCTurk\'e limit emir gönderiliyor...', { txId, side: btcturkSide.toUpperCase(), price: orderPrice, amount: orderAmount });
             const orderResponse = await this.btcturk.createLimitOrder({
                 symbol: 'XRPUSDT',
                 side: btcturkSide,
@@ -901,20 +790,9 @@ class ArbitrageBot {
                 price: orderPrice
             });
 
-            logger.info('✅ Emir başarıyla oluşturuldu!', {
-                orderId: orderResponse.id,
-                side: btcturkSide.toUpperCase(),
-                price: orderPrice,
-                amount: orderAmount,
-                status: orderResponse.status
-            });
-
-            // ============================================================================
-            // 7. STATE GÜNCELLEME
-            // ============================================================================
-
             this.currentOrder = {
                 active: true,
+                txId: txId, // Task 5.1
                 exchange: 'btcturk',
                 orderId: orderResponse.id,
                 side: btcturkSide.toUpperCase(),
@@ -922,25 +800,29 @@ class ArbitrageBot {
                 amount: orderAmount,
                 scenario: scenario,
                 timestamp: Date.now(),
-                lastOrderPrice: orderPrice,
-                lastBinancePrice: scenario === 'SELL' ? this.prices.binance.ask : this.prices.binance.bid,
-                expectedProfit: profitScenario.profit.amount,  // Beklenen kar
-                isDryRun: false
+                expectedProfit: profitScenario.profit.amount, // Task 5.2
+                lastBinancePrice: scenario === 'SELL' ? this.prices.binance.ask : this.prices.binance.bid
             };
-
-            // ============================================================================
-            // 8. EMİR MONİTORİNG BAŞLAT
-            // ============================================================================
+            logger.info('✅ Emir başarıyla oluşturuldu!', { txId, orderId: orderResponse.id });
 
             this.startOrderMonitoring();
-
             return true;
 
         } catch (error) {
-            logger.error('❌ Emir oluşturma hatası', {
-                error: error.message,
-                stack: error.stack
-            });
+            this.metrics.tradesFailed++; // Task 5.2
+            const errorMessage = error.message?.toLowerCase() || '';
+            const isInsufficientBalance = errorMessage.includes('insufficient') || errorMessage.includes('balance');
+            const isPrecisionOrNotionalError = errorMessage.includes('filter failure') || errorMessage.includes('size') || errorMessage.includes('precision') || errorMessage.includes('small');
+
+            if (isInsufficientBalance) {
+                logger.error('❌ Emir reddedildi: YETERSİZ BAKİYE.', { txId, scenario, error: error.message });
+                this.updateBalances();
+            } else if (isPrecisionOrNotionalError) {
+                logger.error('❌ Emir reddedildi: MİKTAR/TUTAR HATASI. Bot durduruluyor.', { txId, scenario, error: error.message });
+                this.stop();
+            } else {
+                logger.error('❌ Emir oluşturma hatası (Bilinmeyen sebep)', { txId, scenario, error: error.message, stack: error.stack });
+            }
             return false;
         }
     }
@@ -971,220 +853,121 @@ class ArbitrageBot {
         }, this.config.orderCheckInterval);
     }
     
-    /**
-     * Emir durumunu kontrol et
-     *
-     * ✅ DÜZELTME 28-10-2025: Dry-run desteği eklendi
-     */
-    async checkOrderStatus() {
-        if (!this.currentOrder.active) {
-            return;
-        }
-
-        try {
-            // ✅ DRY-RUN modu kontrolü
-            if (this.currentOrder.isDryRun) {
-                // Simülasyon: 10 saniye sonra emir "dolmuş" gibi davran
-                const orderAge = Date.now() - this.currentOrder.timestamp;
-                const fillTime = 10000; // 10 saniye
-
-                if (orderAge > fillTime) {
-                    logger.info('🧪 DRY-RUN: Emir simüle edildi (dolmuş gibi)', {
-                        orderId: this.currentOrder.orderId,
-                        side: this.currentOrder.side,
-                        price: this.currentOrder.price,
-                        amount: this.currentOrder.amount,
-                        age: (orderAge / 1000).toFixed(0) + 's'
-                    });
-
-                    // State temizle
-                    this.currentOrder.active = false;
-
-                    // Monitoring durdur
-                    if (this.intervals.orderMonitoring) {
-                        clearInterval(this.intervals.orderMonitoring);
-                        this.intervals.orderMonitoring = null;
-                    }
-
-                    // Counter order tetikle (simüle)
-                    await this.executeCounterOrder();
-                }
-
+        async checkOrderStatus() {
+            if (!this.currentOrder.active) {
                 return;
             }
+            const { txId, orderId, timestamp, amount, expectedProfit } = this.currentOrder;
 
-            // GERÇEK MOD: BTCTurk'ten emir durumunu sorgula
-            const order = await this.btcturk.getOrder(this.currentOrder.orderId);
+            try {
+                const order = await this.btcturk.getOrder(orderId);
+                const fillDuration = Date.now() - timestamp;
 
-            logger.debug('📊 Emir durumu kontrol edildi', {
-                orderId: order.id,
-                status: order.status,
-                filled: order.quantity - order.leftAmount
-            });
+                logger.debug('📊 Emir durumu kontrol edildi', { txId, orderId, status: order.status });
 
-            // Emir tamamen doldu mu?
-            if (order.status === 'Closed' || order.leftAmount === 0) {
-                logger.info('✅ Emir tamamen doldu!', {
-                    orderId: order.id,
-                    side: this.currentOrder.side,
-                    price: this.currentOrder.price,
-                    amount: this.currentOrder.amount
-                });
+                const isFullyFilled = order.status === 'Closed' || order.leftAmount <= 0.0001;
+                const isPartiallyFilled = order.executedQuantity > 0 && !isFullyFilled;
 
-                // State temizle (counter order ÖNCE!)
-                this.currentOrder.active = false;
+                if (isPartiallyFilled) {
+                    const filledAmount = order.executedQuantity;
+                    const proRatedProfit = expectedProfit * (filledAmount / amount);
+                    logger.warn('⚠️ Emir kısmen doldu! Karşı işlem ve iptal tetikleniyor.', {
+                        txId, orderId,
+                        filledAmount,
+                        fillDuration: `${(fillDuration / 1000).toFixed(2)}s`
+                    });
 
-                // Monitoring durdur
-                if (this.intervals.orderMonitoring) {
-                    clearInterval(this.intervals.orderMonitoring);
-                    this.intervals.orderMonitoring = null;
+                    if (this.intervals.orderMonitoring) clearInterval(this.intervals.orderMonitoring);
+
+                    this.currentOrder.active = false;
+                    this.currentOrder.orderId = null;
+
+                    await Promise.all([
+                        this.executeCounterOrder(filledAmount, orderId, txId, proRatedProfit),
+                        this.btcturk.cancelOrder(orderId)
+                    ]);
+
+                    logger.info(`✅ Kısmi dolum yönetimi tamamlandı.`, { txId });
+                    await this.updateBalances();
+                    return;
                 }
 
-                // Counter order tetikle
-                await this.executeCounterOrder();
-            }
+                if (isFullyFilled) {
+                    logger.info('✅ Emir tamamen doldu!', { txId, orderId, fillDuration: `${(fillDuration / 1000).toFixed(2)}s` });
 
-        } catch (error) {
-            logger.error('❌ Emir durum kontrolü hatası', {
-                error: error.message
-            });
-        }
-    }
-    
-    /**
-     * Counter order (karşı emir) yürüt
-     * BTCTurk'teki limit emir dolduysa, Binance'te market emir yap
-     *
-     * ✅ DÜZELTME 28-10-2025: Dry-run desteği eklendi
-     */
-    async executeCounterOrder() {
-        try {
-            logger.info('🔄 Counter order başlatılıyor...', {
-                scenario: this.currentOrder.scenario,
-                isDryRun: this.currentOrder.isDryRun || false
-            });
+                    if (this.intervals.orderMonitoring) clearInterval(this.intervals.orderMonitoring);
 
-            const scenario = this.currentOrder.scenario;
-            const amount = this.currentOrder.amount;
-            const isDryRun = this.currentOrder.isDryRun || false;
+                    const filledAmount = amount;
+                    this.currentOrder.active = false;
+                    this.currentOrder.orderId = null;
 
-            let binanceSide;
-            let expectedPrice;
+                    await this.executeCounterOrder(filledAmount, orderId, txId, expectedProfit);
+                    await this.updateBalances();
+                }
 
-            if (scenario === 'SELL') {
-                // BTCTurk'te SELL yaptık -> Binance'te BUY yapacağız
-                binanceSide = 'BUY';
-                expectedPrice = this.prices.binance.ask;
-            } else {
-                // BTCTurk'te BUY yaptık -> Binance'te SELL yapacağız
-                binanceSide = 'SELL';
-                expectedPrice = this.prices.binance.bid;
-            }
-
-            // ✅ DRY-RUN modu kontrolü
-            if (isDryRun) {
-                logger.info('🧪 DRY-RUN: Binance counter order simüle ediliyor', {
-                    side: binanceSide,
-                    amount: amount,
-                    expectedPrice: expectedPrice,
-                    expectedProfit: this.currentOrder.expectedProfit
-                });
-
-                // Simüle edilmiş kar hesaplama
-                const simulatedProfit = this.currentOrder.expectedProfit || 0;
-
-                logger.info('🎉 DRY-RUN: Arbitraj döngüsü simüle edildi!', {
-                    btcturkOrder: this.currentOrder.orderId,
-                    binanceOrder: 'DRY_RUN_COUNTER_' + Date.now(),
-                    scenario: scenario,
-                    btcturkPrice: this.currentOrder.price,
-                    binancePrice: expectedPrice,
-                    simulatedProfit: simulatedProfit.toFixed(4) + ' USDT'
-                });
-
-                // Bakiyeleri güncelle (dry-run'da da gerekli)
-                await this.updateBalances();
-
-                // Yeni emir oluştur
-                logger.info('🔁 DRY-RUN: Yeni döngü başlatılıyor...');
-
-                await new Promise(resolve => setTimeout(resolve, 1000));
-
-                const newOrderCreated = await this.createNewOrder();
-
-                if (newOrderCreated) {
-                    logger.info('✅ DRY-RUN: Yeni emir simüle edildi');
+            } catch (error) {
+                const errorMessage = error.message?.toLowerCase() || '';
+                if (errorMessage.includes('order not found')) {
+                    logger.warn('Emir durumu sorgulanırken bulunamadı. State temizleniyor.', { txId, orderId });
+                    if (this.intervals.orderMonitoring) clearInterval(this.intervals.orderMonitoring);
+                    this.currentOrder.active = false;
+                    this.currentOrder.orderId = null;
+                    this.updateBalances();
                 } else {
-                    logger.warn('⚠️  DRY-RUN: Yeni emir oluşturulamadı');
+                    logger.error('❌ Emir durum kontrolü hatası', { txId, orderId, error: error.message });
                 }
-
-                return true;
             }
-
-            // GERÇEK MOD: Binance market emir
-            logger.info('📤 Binance market emri gönderiliyor...', {
-                side: binanceSide,
-                amount: amount,
-                expectedPrice: expectedPrice
-            });
-
-            const counterOrder = await this.binance.createMarketOrder({
-                symbol: 'XRPUSDT',
-                side: binanceSide,
-                quantity: amount
-            });
-
-            logger.info('✅ Counter order başarılı!', {
-                orderId: counterOrder.orderId,
-                side: binanceSide,
-                executedQty: counterOrder.executedQty,
-                status: counterOrder.status
-            });
-
-            // Başarılı arbitraj döngüsü tamamlandı
-            const actualProfit = this.currentOrder.expectedProfit || 0;
-
-            logger.info('🎉 Arbitraj döngüsü tamamlandı!', {
-                btcturkOrder: this.currentOrder.orderId,
-                binanceOrder: counterOrder.orderId,
-                scenario: scenario,
-                btcturkPrice: this.currentOrder.price,
-                binancePrice: expectedPrice,
-                expectedProfit: actualProfit.toFixed(4) + ' USDT'
-            });
-
-            // Bakiyeleri güncelle
-            await this.updateBalances();
-
-            // SÜREKLI AÇIK EMİR STRATEJİSİ: Yeni emir oluştur
-            logger.info('🔁 Yeni döngü başlatılıyor, yeni emir oluşturuluyor...');
-
-            // Kısa bir bekleme (rate limiting ve market stabilization)
-            await new Promise(resolve => setTimeout(resolve, 1000));
-
-            // Yeni emir oluştur
-            const newOrderCreated = await this.createNewOrder();
-
-            if (newOrderCreated) {
-                logger.info('✅ Yeni emir oluşturuldu, sürekli açık emir stratejisi devam ediyor');
-            } else {
-                logger.warn('⚠️  Yeni emir oluşturulamadı, fiyat güncellemelerinde tekrar denenecek');
-            }
-
-            return true;
-
-        } catch (error) {
-            logger.error('❌ Counter order hatası', {
-                error: error.message,
-                stack: error.stack
-            });
-
-            // TODO: Hata durumunda ne yapılacak? (recovery stratejisi)
-            return false;
         }
-    }
-    
-    /**
+        
+            async executeCounterOrder(overrideAmount = null, originalOrderId = null, txId = null, profit = 0) {
+                try {
+                    const amount = overrideAmount;
+                    if (!amount || amount <= 0) {
+                        logger.warn('⚠️ Counter order için geçersiz miktar, işlem atlanıyor', { txId, amount });
+                        return false;
+                    }
+        
+                    logger.info('🔄 Counter order başlatılıyor...', { txId, originalOrderId, amount });
+        
+                    const scenario = this.currentOrder.scenario;
+                    const binanceSide = scenario === 'SELL' ? 'BUY' : 'SELL';
+        
+                    logger.info('📤 Binance market emri gönderiliyor...', { txId, side: binanceSide, amount });
+                    const counterOrder = await this.binance.createMarketOrder({
+                        symbol: 'XRPUSDT',
+                        side: binanceSide,
+                        quantity: amount
+                    });
+        
+                    this.metrics.tradesSucceeded++;
+                    this.metrics.totalProfit += profit;
+        
+                    logger.profit('🎉 Arbitraj döngüsü tamamlandı!', {
+                        txId,
+                        profit: `${profit.toFixed(4)} USDT`,
+                        totalProfit: `${this.metrics.totalProfit.toFixed(4)} USDT`,
+                        successfulTrades: this.metrics.tradesSucceeded,
+                        failedTrades: this.metrics.tradesFailed,
+                        originalOrderId,
+                        counterOrderId: counterOrder.id,
+                    });
+        
+                    setTimeout(() => this.checkArbitrageOpportunity(), 2000);
+                    return true;
+        
+                } catch (error) {
+                    this.metrics.tradesFailed++;
+                    const alertMessage = `🚨 KRİTİK HATA: Karşı emir atılamadı!\nBorsa: Binance\nOrijinal Emir ID: ${originalOrderId}\nSebep: ${error.message}`;
+                    notificationService.sendAlert(alertMessage);
+        
+                    logger.error('❌ Counter order hatası', {
+                        txId, originalOrderId,
+                        error: error.message,
+                        stack: error.stack
+                    });
+                    return false;
+                }
+            }    /**
      * Bot'u başlat
      */
     async start() {

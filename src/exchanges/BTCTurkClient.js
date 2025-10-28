@@ -18,10 +18,15 @@ class BTCTurkClient {
         
         this.ws = null;
         this.priceCallback = null;
-        this.reconnectInterval = config.rateLimit?.retryDelay || 5000;
-        this.pingInterval = null;
-        this.isConnected = false;
         this.isManualClose = false; // Manuel kapatma flag'i
+
+        // Task 4.3: WebSocket Robustness
+        this.reconnectAttempts = 0;
+        this.maxReconnectAttempts = config.websocket?.maxReconnectAttempts || 10;
+        this.initialReconnectDelay = config.websocket?.reconnectDelay || 5000;
+        this.lastMessageTimestamp = null;
+        this.healthCheckInterval = null;
+        this.staleConnectionThreshold = 60000; // 60 saniye
         
         // Rate limiting
         this.requestQueue = [];
@@ -109,6 +114,54 @@ class BTCTurkClient {
      * Execute HTTP request with native HTTPS
      */
     async executeRequest(method, endpoint, data = null) {
+        // Config'den ayarları al
+        const enableRetry = this.rateLimit?.enableRetry ?? true;
+        const maxRetries = this.rateLimit?.maxRetries || 3;
+        const initialDelay = this.rateLimit?.retryDelay || 1000;
+
+        // Eğer yeniden deneme mekanizması aktif değilse, direkt isteği yap
+        if (!enableRetry) {
+            return this.performRequest(method, endpoint, data);
+        }
+
+        // Yeniden deneme mekanizması aktifse, döngü içinde isteği yap
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                return await this.performRequest(method, endpoint, data, attempt > 0);
+            } catch (error) {
+                const isRateLimitError = error.response?.status === 429;
+                const isTimeoutError = error.code === 'ETIMEDOUT';
+                const isNetworkError = error.code === 'ECONNRESET' || error.code === 'ENOTFOUND';
+
+                if ((isRateLimitError || isTimeoutError || isNetworkError) && attempt < maxRetries) {
+                    const delay = initialDelay * (2 ** attempt);
+                    let reason = 'BTCTurk API request failed';
+                    if (isTimeoutError) reason = 'BTCTurk connection timed out';
+                    if (isRateLimitError) reason = 'BTCTurk rate limit hit';
+                    if (isNetworkError) reason = 'BTCTurk network error';
+
+                    logger.warn(`${reason} (Attempt ${attempt + 1}/${maxRetries}). Retrying in ${delay}ms...`, {
+                        error: error.message,
+                        status: error.response?.status
+                    });
+                    await this.sleep(delay);
+                    continue; // Retry
+                }
+
+                logger.error(`BTCTurk API Error after all retries: ${method} ${endpoint}`, {
+                    status: error.response?.status,
+                    message: error.response?.data?.message || error.message
+                });
+                throw error;
+            }
+        }
+    }
+
+    /**
+     * Gerçek HTTP isteğini yapan özel metod
+     */
+    async performRequest(method, endpoint, data = null, isRetry = false) {
+        const startTime = Date.now(); // Performans ölçümü için başlangıç zamanı
         const uri = endpoint;
         const urlString = `${this.baseURL}${uri}`;
         const headers = this.getHeaders(method, uri, data ? JSON.stringify(data) : '');
@@ -124,33 +177,16 @@ class BTCTurkClient {
         return new Promise((resolve, reject) => {
             const req = https.request(options, (res) => {
                 let responseData = '';
-
-                res.on('data', (chunk) => {
-                    responseData += chunk;
-                });
-
+                res.on('data', (chunk) => { responseData += chunk; });
                 res.on('end', () => {
                     try {
+                        const duration = Date.now() - startTime; // Performans ölçümü için bitiş
                         const jsonData = JSON.parse(responseData);
-                        
                         if (res.statusCode >= 200 && res.statusCode < 300) {
-                            logger.api(`BTCTurk ${method} ${endpoint}`, {
-                                status: res.statusCode
-                            });
+                            if (!isRetry) logger.api(`BTCTurk ${method} ${endpoint}`, { status: res.statusCode, duration: `${duration}ms` });
                             resolve(jsonData);
                         } else {
-                            logger.error(`BTCTurk API Error: ${method} ${endpoint}`, {
-                                status: res.statusCode,
-                                message: jsonData.message || 'Unknown error'
-                            });
-                            
-                            // BTCTurk'ün error response'unu logla
-                            logger.error('❌ BTCTurk emir oluşturma hatası:', {
-                                error: jsonData,
-                                params: data
-                            });
-                            
-                            const error = new Error(`Request failed with status code ${res.statusCode}`);
+                            const error = new Error(`Request failed with status code ${res.statusCode}: ${jsonData.message}`);
                             error.response = { data: jsonData, status: res.statusCode };
                             reject(error);
                         }
@@ -161,11 +197,9 @@ class BTCTurkClient {
             });
 
             req.on('error', (error) => {
-                logger.error('❌ BTCTurk request error:', error.message);
                 reject(error);
             });
 
-            // POST/DELETE için body gönder
             if ((method === 'POST' || method === 'DELETE') && data) {
                 req.write(JSON.stringify(data));
             }
@@ -219,10 +253,19 @@ class BTCTurkClient {
             const balances = {};
             if (result.data) {
                 result.data.forEach(item => {
+                    const free = parseFloat(item.free);
+                    const locked = parseFloat(item.locked);
+
+                    // Task 4.5: Balance Data Validation
+                    if (isNaN(free) || isNaN(locked) || free < 0 || locked < 0) {
+                        logger.warn(`[Data Validation] BTCTurk'ten geçersiz bakiye verisi geldi, atlanıyor.`, { asset: item.asset, free: item.free, locked: item.locked });
+                        return; // Bu varlığı atla
+                    }
+
                     balances[item.asset] = {
-                        free: parseFloat(item.free),
-                        locked: parseFloat(item.locked),
-                        total: parseFloat(item.balance)
+                        free: free,
+                        locked: locked,
+                        total: free + locked
                     };
                 });
             }
@@ -353,17 +396,30 @@ class BTCTurkClient {
             }
             
             const order = result.data;
+            const price = parseFloat(order.price);
+            const quantity = parseFloat(order.quantity);
+            const leftAmount = parseFloat(order.leftAmount || 0);
+
+            // Task 4.5: Order Data Validation
+            if (isNaN(price) || isNaN(quantity) || isNaN(leftAmount) || price < 0 || quantity < 0 || leftAmount < 0) {
+                logger.error(`[Data Validation] BTCTurk'ten geçersiz emir verisi geldi.`, { orderId, data: order });
+                throw new Error('Invalid order data received from BTCTurk');
+            }
             
             return {
                 id: order.id,
-                status: order.status, // untouched, partial, closed, canceled
+                status: order.status,
                 side: order.type?.toUpperCase() || 'UNKNOWN',
-                price: parseFloat(order.price),
-                quantity: parseFloat(order.quantity),
-                executedQuantity: parseFloat(order.quantity) - parseFloat(order.leftAmount || 0),
+                price: price,
+                quantity: quantity,
+                leftAmount: leftAmount,
+                executedQuantity: quantity - leftAmount,
                 timestamp: order.updateTime || order.datetime
             };
         } catch (error) {
+            if (error.message?.toLowerCase().includes('not found')) {
+                throw new Error('Order not found');
+            }
             logger.error('BTCTurk emir sorgulama hatası:', { orderId, error: error.message });
             throw error;
         }
@@ -494,8 +550,12 @@ class BTCTurkClient {
     /**
      * WebSocket bağlantısı kurma
      */
+    /**
+     * WebSocket bağlantısı kurma
+     */
     async connectWebSocket(callback, symbol = 'XRPUSDT') {
         this.priceCallback = callback; // Callback'i sakla
+        this.isManualClose = false;
         
         return new Promise((resolve, reject) => {
             try {
@@ -503,14 +563,10 @@ class BTCTurkClient {
                 
                 this.ws.on('open', () => {
                     logger.websocket('✅ BTCTurk WebSocket bağlantısı açıldı');
-                    
-                    // Ticker channel'a abone ol
+                    this.reconnectAttempts = 0; // Başarılı bağlantıda sayacı sıfırla
+                    this.lastMessageTimestamp = Date.now();
                     this.subscribeToTicker(symbol);
-                    
-                    // Ping/Pong mekanizması
-                    this.setupPingPong();
-                    
-                    this.isConnected = true;
+                    this.startHealthCheck(symbol); // Sağlık kontrolünü başlat
                     resolve();
                 });
 
@@ -520,22 +576,13 @@ class BTCTurkClient {
 
                 this.ws.on('error', (error) => {
                     logger.error('❌ BTCTurk WebSocket hatası:', error.message);
-                    this.isConnected = false;
                 });
 
                 this.ws.on('close', () => {
-                    this.isConnected = false;
-                    
+                    logger.warn('⚠️  BTCTurk WebSocket bağlantısı kapandı');
                     if (!this.isManualClose) {
-                        logger.warn('⚠️  BTCTurk WebSocket bağlantısı kapandı');
                         this.reconnect(symbol);
                     }
-                    
-                    this.isManualClose = false; // Reset flag
-                });
-
-                this.ws.on('ping', () => {
-                    this.ws.pong();
                 });
 
             } catch (error) {
@@ -589,6 +636,7 @@ class BTCTurkClient {
      * WebSocket mesajlarını işle
      */
     handleWebSocketMessage(data) {
+        this.lastMessageTimestamp = Date.now(); // Update timestamp on every message
         try {
             const message = JSON.parse(data);
             
@@ -613,58 +661,47 @@ class BTCTurkClient {
                         timestamp: payload.T || Date.now()
                     };
                     
-                    logger.websocket('BTCTurk', 'price_update', {
-                        bid: tickerData.bid,
-                        ask: tickerData.ask,
-                        spread: (tickerData.ask - tickerData.bid).toFixed(4)
-                    });
-                    
                     // Callback'i çağır
                     if (this.priceCallback && typeof this.priceCallback === 'function') {
                         this.priceCallback(tickerData);
                     }
                 }
-                
-                // Login response (type: 114)
-                else if (type === 114) {
-                    logger.websocket('🔐 WebSocket login yanıtı alındı');
-                }
-                
-                // Subscription response (type: 151)
-                else if (type === 151) {
-                    logger.websocket('✅ Kanal subscription yanıtı:', payload);
-                }
             }
         } catch (error) {
-            logger.error('WebSocket mesaj işleme hatası:', error.message);
+            logger.error('BTCTurk WebSocket mesaj işleme hatası:', error.message);
         }
     }
 
     /**
-     * Ping/Pong keep-alive mekanizması
+     * Task 4.3: Donmuş bağlantıları tespit etmek için sağlık kontrolü
      */
-    setupPingPong() {
-        // Her 30 saniyede bir ping gönder
-        this.pingInterval = setInterval(() => {
-            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                this.ws.ping();
-                logger.websocket('🏓 Ping gönderildi');
+    startHealthCheck(symbol) {
+        this.clearTimers(); // Önceki timer'ları temizle
+        this.healthCheckInterval = setInterval(() => {
+            if (Date.now() - this.lastMessageTimestamp > this.staleConnectionThreshold) {
+                logger.warn('BTCTurk WebSocket stale connection detected. Forcing reconnect.');
+                if (this.ws) this.ws.terminate(); // `close` event'ini tetikler ve reconnect mantığını başlatır
             }
-        }, 30000);
+        }, 15000); // Her 15 saniyede bir kontrol et
     }
 
     /**
-     * Otomatik yeniden bağlanma
+     * Task 4.3: Exponential backoff ile otomatik yeniden bağlanma
      */
     reconnect(symbol = 'XRPUSDT') {
-        if (this.pingInterval) {
-            clearInterval(this.pingInterval);
+        this.clearTimers();
+        if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+            logger.error('BTCTurk WebSocket max reconnect attempts reached. Giving up.');
+            return;
         }
 
+        const delay = this.initialReconnectDelay * (2 ** this.reconnectAttempts);
+        this.reconnectAttempts++;
+
         setTimeout(() => {
-            logger.websocket('🔄 BTCTurk WebSocket yeniden bağlanıyor...');
+            logger.websocket(`🔄 BTCTurk WebSocket yeniden bağlanıyor... (Deneme: ${this.reconnectAttempts})`);
             this.connectWebSocket(this.priceCallback, symbol);
-        }, this.reconnectInterval);
+        }, delay);
     }
 
     /**
@@ -679,16 +716,20 @@ class BTCTurkClient {
      */
     disconnectWebSocket() {
         this.isManualClose = true; // Manuel kapatma işareti
-        
-        if (this.pingInterval) {
-            clearInterval(this.pingInterval);
-            this.pingInterval = null;
-        }
-        
+        this.clearTimers();
         if (this.ws) {
             this.ws.close();
             this.ws = null;
-            this.isConnected = false;
+        }
+    }
+
+    /**
+     * Task 4.3: Tüm zamanlayıcıları temizle
+     */
+    clearTimers() {
+        if (this.healthCheckInterval) {
+            clearInterval(this.healthCheckInterval);
+            this.healthCheckInterval = null;
         }
     }
 
