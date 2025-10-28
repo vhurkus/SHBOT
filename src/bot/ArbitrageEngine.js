@@ -669,7 +669,7 @@ class ArbitrageEngine {
      * @param {number} balances.binance.USDT - Binance USDT bakiyesi
      * @returns {object} Senaryo bilgisi
      */
-    determineScenario(balances) {
+    determineScenario(balances, prices) {
         const btcturkXRP = balances.btcturk.XRP;
         const binanceXRP = balances.binance.XRP;
         const btcturkUSDT = balances.btcturk.USDT;
@@ -718,7 +718,7 @@ class ArbitrageEngine {
             logger.info('📊 Senaryo: Her iki borsada da XRP yok → Hazırlık gerekli');
 
             // Binance'te yeterli USDT var mı?
-            const estimatedCost = tradeAmount * 2.7 * 1.002; // Rough estimate: price * 1.002 (fee)
+            const estimatedCost = tradeAmount * prices.binanceAsk * (1 + this.fees.binance.taker);
             const hasEnoughUSDT = binanceUSDT >= estimatedCost;
 
             if (!hasEnoughUSDT) {

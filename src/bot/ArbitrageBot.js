@@ -11,10 +11,10 @@ import ArbitrageEngine from './ArbitrageEngine.js';
 import { roundToBinanceLOT_SIZE, roundToBTCTurkScale } from '../utils/precision.js';
 
 class ArbitrageBot {
-    constructor(options = {}) {
+    constructor(options = {}, clients = {}) {
         // Exchange clients
-        this.btcturk = null;
-        this.binance = null;
+        this.btcturk = clients.btcturk || null;
+        this.binance = clients.binance || null;
         
         // Arbitrage engine
         this.engine = null;
@@ -122,22 +122,24 @@ class ArbitrageBot {
         
         try {
             // 1. Exchange client'ları oluştur
-            logger.info('📡 Exchange client\'ları oluşturuluyor...');
-            this.btcturk = new BTCTurkClient({
-                apiKey: config.btcturk.apiKey,
-                apiSecret: config.btcturk.apiSecret,
-                baseURL: config.btcturk.baseURL,
-                wsURL: config.btcturk.wsURL,
-                rateLimit: config.btcturk.rateLimit
-            });
-            
-            this.binance = new BinanceClient({
-                apiKey: config.binance.apiKey,
-                apiSecret: config.binance.apiSecret,
-                baseURL: config.binance.baseURL,
-                wsURL: config.binance.wsURL,
-                rateLimit: config.binance.rateLimit
-            });
+            if (!this.btcturk && !this.binance) {
+                logger.info('📡 Exchange client\'ları oluşturuluyor...');
+                this.btcturk = new BTCTurkClient({
+                    apiKey: config.btcturk.apiKey,
+                    apiSecret: config.btcturk.apiSecret,
+                    baseURL: config.btcturk.baseURL,
+                    wsURL: config.btcturk.wsURL,
+                    rateLimit: config.btcturk.rateLimit
+                });
+
+                this.binance = new BinanceClient({
+                    apiKey: config.binance.apiKey,
+                    apiSecret: config.binance.apiSecret,
+                    baseURL: config.binance.baseURL,
+                    wsURL: config.binance.wsURL,
+                    rateLimit: config.binance.rateLimit
+                });
+            }
 
             // ✅ 1.5. Binance server time sync
             logger.info('🕐 Binance server time senkronize ediliyor...');
@@ -738,7 +740,7 @@ class ArbitrageBot {
                 }
             };
 
-            const scenarioInfo = this.engine.determineScenario(balances);
+            const scenarioInfo = this.engine.determineScenario(balances, this.prices);
 
             // Senaryo belirlenemedi mi?
             if (!scenarioInfo.scenario) {
