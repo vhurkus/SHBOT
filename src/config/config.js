@@ -150,7 +150,8 @@ const config = {
             minBalance: {
                 xrp: getFloat('MIN_XRP_BALANCE', 10),
                 usdt: getFloat('MIN_USDT_BALANCE', 10)
-            }
+            },
+            minNotionalValue: getFloat('MIN_NOTIONAL_VALUE', 10) // Minimum 10 USDT
         }
     },
 

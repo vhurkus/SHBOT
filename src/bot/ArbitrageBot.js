@@ -554,6 +554,7 @@ class ArbitrageBot {
                 const firstOrder = btcturkOrders[0];
                 const scenario = firstOrder.type === 'sell' ? 'SELL' : 'BUY';
                 
+                const initialBinancePrice = scenario === 'SELL' ? this.prices.binance.ask : this.prices.binance.bid;
                 this.currentOrder = {
                     active: true,
                     exchange: 'btcturk',
@@ -564,7 +565,8 @@ class ArbitrageBot {
                     scenario: scenario,
                     timestamp: Date.now(),
                     lastOrderPrice: parseFloat(firstOrder.price),
-                    lastBinancePrice: scenario === 'SELL' ? this.prices.binance.ask : this.prices.binance.bid
+                    lastBinancePrice: initialBinancePrice, // Set from current price
+                    initialBinancePrice: initialBinancePrice // Set from current price
                 };
                 
                 // Mevcut emir için monitoring başlat
@@ -588,75 +590,78 @@ class ArbitrageBot {
      * Sürekli açık emir stratejisinin core metodu
      */
     async updateOrder() {
+        // Zaten güncelleme işlemi devam ediyorsa atla
+        if (this.isUpdatingOrder) {
+            logger.debug('⏭️  Emir güncelleme zaten devam ediyor, atlandı');
+            return false;
+        }
+
+        if (!this.currentOrder.active) {
+            logger.warn('⚠️  Güncellenecek açık emir yok');
+            return false;
+        }
+
+        // Lock'u ayarla
+        this.isUpdatingOrder = true;
+
         try {
-            if (!this.currentOrder.active) {
-                logger.warn('⚠️  Güncellenecek açık emir yok');
-                return false;
-            }
-            
-            // Zaten güncelleme işlemi devam ediyorsa atla
-            if (this.isUpdatingOrder) {
-                logger.debug('⏭️  Emir güncelleme zaten devam ediyor, atlandı');
-                return false;
-            }
-            
-            // Lock flag'i set et
-            this.isUpdatingOrder = true;
-            
             logger.info('🔄 Emir güncelleme başlıyor...', {
                 currentOrderId: this.currentOrder.orderId,
                 currentPrice: this.currentOrder.price,
                 scenario: this.currentOrder.scenario
             });
-            
+
             // 1. Mevcut emri iptal et
             const cancelResult = await this.btcturk.cancelOrder(this.currentOrder.orderId);
-            
+
             if (!cancelResult) {
-                logger.error('❌ Emir iptali başarısız');
-                this.isUpdatingOrder = false; // Lock'u aç
+                logger.error('❌ Emir iptali başarısız, state temizleniyor', { orderId: this.currentOrder.orderId });
+                // State'i güvenli bir şekilde temizle ve çık
+                this.currentOrder.active = false;
+                this.currentOrder.orderId = null;
                 return false;
             }
-            
+
             logger.info('✅ Mevcut emir iptal edildi', {
                 orderId: this.currentOrder.orderId
             });
-            
+
             // State'i temizle
             this.currentOrder.active = false;
             this.currentOrder.orderId = null;
-            
-            // Kısa bir bekleme (BTCTurk API emir iptalini işlesin)
+
+            // Kısa bir bekleme (API'nin iptali işlemesi için)
             await new Promise(resolve => setTimeout(resolve, 1000));
-            
+
             // 2. Yeni emir oluştur
             const newOrderCreated = await this.createNewOrder();
-            
+
             if (newOrderCreated) {
                 logger.info('✅ Emir güncelleme başarılı', {
                     newOrderId: this.currentOrder.orderId,
                     newPrice: this.currentOrder.price
                 });
-                this.isUpdatingOrder = false; // Lock'u aç
                 return true;
             } else {
-                logger.warn('⚠️  Yeni emir oluşturulamadı');
-                this.isUpdatingOrder = false; // Lock'u aç
+                logger.warn('⚠️  Yeni emir oluşturulamadı. Bot bir sonraki döngüde tekrar deneyecek.');
                 return false;
             }
-            
+
         } catch (error) {
             logger.error('❌ Emir güncelleme hatası', {
                 error: error.message,
                 orderId: this.currentOrder.orderId
             });
-            
-            // Hata durumunda state'i temizle
+
+            // Hata durumunda state'i güvenli bir şekilde temizle
             this.currentOrder.active = false;
             this.currentOrder.orderId = null;
-            this.isUpdatingOrder = false; // Lock'u aç
-            
             return false;
+
+        } finally {
+            // Lock'u her zaman kaldır
+            this.isUpdatingOrder = false;
+            logger.debug('🔄 Emir güncelleme lock serbest bırakıldı');
         }
     }
     
@@ -695,16 +700,22 @@ class ArbitrageBot {
         // createNewOrder() içinde determineScenario() tüm bakiye kontrollerini yapacak
         // XRP yoksa ama USDT varsa hazırlık işlemi yapacak
 
-        // Throttling timestamp'i güncelle
-        this.lastOrderAttemptTime = now;
-
         // Sürekli açık emir stratejisi: Aktif emir yoksa emir oluşturmayı dene
         try {
-            await this.createNewOrder();
+            const orderCreated = await this.createNewOrder();
+
+            // Eğer emir oluşturma denemesi başarısız olduysa (bakiye yetersizliği, vb.),
+            // bir sonraki deneme için bekleme süresini başlat.
+            if (!orderCreated) {
+                this.lastOrderAttemptTime = Date.now();
+                logger.debug(`Emir oluşturma başarısız, ${this.orderAttemptCooldown / 1000} saniye cooldown başlatıldı.`);
+            }
         } catch (error) {
-            logger.error('❌ Arbitraj kontrolü hatası', {
+            logger.error('❌ Arbitraj kontrolü sırasında beklenmedik hata', {
                 error: error.message
             });
+            // Beklenmedik bir hata durumunda da cooldown uygula
+            this.lastOrderAttemptTime = Date.now();
         }
     }
 
@@ -923,6 +934,19 @@ class ArbitrageBot {
             const orderAmount = roundToBTCTurkScale(this.config.tradeAmount, 4);
             const btcturkSide = scenario === 'SELL' ? 'sell' : 'buy';
 
+            // Notional Değer Kontrolü (Minimum Emir Tutarı)
+            const notionalValue = orderPrice * orderAmount;
+            if (notionalValue < config.trading.safety.minNotionalValue) {
+                logger.warn('❌ Emir oluşturma reddedildi: Minimum emir değeri altında.', {
+                    txId,
+                    notionalValue: notionalValue.toFixed(4),
+                    minNotional: config.trading.safety.minNotionalValue,
+                    price: orderPrice,
+                    amount: orderAmount
+                });
+                return false;
+            }
+
             logger.info('📤 BTCTurk\'e limit emir gönderiliyor...', { txId, side: btcturkSide.toUpperCase(), price: orderPrice, amount: orderAmount });
             const orderResponse = await this.btcturk.createLimitOrder({
                 symbol: 'XRPUSDT',
@@ -942,7 +966,8 @@ class ArbitrageBot {
                 scenario: scenario,
                 timestamp: Date.now(),
                 expectedProfit: profitScenario.profit.amount, // Task 5.2
-                lastBinancePrice: scenario === 'SELL' ? this.prices.binance.ask : this.prices.binance.bid
+                lastBinancePrice: scenario === 'SELL' ? this.prices.binance.ask : this.prices.binance.bid, // Persist this
+                initialBinancePrice: scenario === 'SELL' ? this.prices.binance.ask : this.prices.binance.bid // Store the initial price
             };
             logger.info('✅ Emir başarıyla oluşturuldu!', { txId, orderId: orderResponse.id });
 
@@ -994,161 +1019,201 @@ class ArbitrageBot {
         }, this.config.orderCheckInterval);
     }
     
-        async checkOrderStatus() {
-            if (!this.currentOrder.active) {
-                return;
-            }
-            const { txId, orderId, timestamp, amount, expectedProfit } = this.currentOrder;
+    async checkOrderStatus() {
+        if (!this.currentOrder.active) {
+            return;
+        }
 
-            try {
-                const order = await this.btcturk.getOrder(orderId);
-                const fillDuration = Date.now() - timestamp;
+        const { txId, orderId, timestamp, amount, expectedProfit, scenario } = this.currentOrder;
 
-                logger.debug('📊 Emir durumu kontrol edildi', { txId, orderId, status: order.status });
+        try {
+            const order = await this.btcturk.getOrder(orderId);
+            const fillDuration = (Date.now() - timestamp) / 1000;
 
-                const isFullyFilled = order.status === 'Closed' || order.leftAmount <= 0.0001;
-                const isPartiallyFilled = order.executedQuantity > 0 && !isFullyFilled;
+            logger.debug('📊 Emir durumu kontrol edildi', { txId, orderId, status: order.status, executed: order.executedQuantity });
 
-                if (isPartiallyFilled) {
-                    const filledAmount = order.executedQuantity;
-                    const proRatedProfit = expectedProfit * (filledAmount / amount);
-                    logger.warn('⚠️ Emir kısmen doldu! Karşı işlem ve iptal tetikleniyor.', {
-                        txId, orderId,
-                        filledAmount,
-                        fillDuration: `${(fillDuration / 1000).toFixed(2)}s`
-                    });
+            const isFullyFilled = order.status === 'Closed' || order.leftAmount <= 0.0001;
+            const isPartiallyFilled = order.executedQuantity > 0 && !isFullyFilled;
 
-                    // Telegram bildirimi - Partial fill
-                    notificationService.notifyPartialFill(txId, orderId, filledAmount, amount).catch(err =>
-                        logger.error('Telegram bildirimi gönderilemedi', { error: err.message })
-                    );
+            if (isFullyFilled) {
+                logger.info('✅ Emir tamamen doldu!', { txId, orderId, fillDuration: `${fillDuration.toFixed(2)}s` });
+                if (this.intervals.orderMonitoring) clearInterval(this.intervals.orderMonitoring);
 
-                    if (this.intervals.orderMonitoring) clearInterval(this.intervals.orderMonitoring);
-
+                // State'i temizlemeden önce counter order'ı güvenle çalıştır
+                const counterOrderSuccess = await this.executeCounterOrder(amount, orderId, txId, expectedProfit, scenario);
+                if (counterOrderSuccess) {
                     this.currentOrder.active = false;
                     this.currentOrder.orderId = null;
-
-                    await Promise.all([
-                        this.executeCounterOrder(filledAmount, orderId, txId, proRatedProfit),
-                        this.btcturk.cancelOrder(orderId)
-                    ]);
-
-                    logger.info(`✅ Kısmi dolum yönetimi tamamlandı.`, { txId });
                     await this.updateBalances();
+                } else {
+                    logger.error('CRITICAL: Emir doldu ama karşı işlem başarısız. Manuel müdahale gerekebilir!', { txId, orderId });
+                    // Bot'u güvenli moda alabilir veya durdurabiliriz.
+                }
+                return;
+            }
+
+            if (isPartiallyFilled) {
+                const filledAmount = order.executedQuantity;
+                const proRatedProfit = expectedProfit * (filledAmount / amount);
+
+                logger.warn('⚠️ Emir kısmen doldu! Karşı işlem ve kalan emrin iptali tetikleniyor.', {
+                    txId, orderId, filledAmount,
+                    remainingAmount: order.leftAmount,
+                    fillDuration: `${fillDuration.toFixed(2)}s`
+                });
+
+                notificationService.notifyPartialFill(txId, orderId, filledAmount, amount).catch(err =>
+                    logger.error('Telegram bildirimi gönderilemedi', { error: err.message })
+                );
+
+                if (this.intervals.orderMonitoring) clearInterval(this.intervals.orderMonitoring);
+
+                // 1. Önce karşı işlemi yap (en kritik adım)
+                const counterOrderSuccess = await this.executeCounterOrder(filledAmount, orderId, txId, proRatedProfit, scenario);
+
+                if (!counterOrderSuccess) {
+                    logger.error('CRITICAL: Kısmi dolum sonrası karşı işlem başarısız. Kalan emir iptal edilmeyecek!', { txId, orderId });
+                    // Monitoring'i yeniden başlat ki bot durumu tekrar değerlendirsin
+                    this.startOrderMonitoring();
                     return;
                 }
 
-                if (isFullyFilled) {
-                    logger.info('✅ Emir tamamen doldu!', { txId, orderId, fillDuration: `${(fillDuration / 1000).toFixed(2)}s` });
+                // 2. Karşı işlem başarılıysa, kalan emri iptal et
+                try {
+                    logger.info(`Kalan ${order.leftAmount} XRP emri iptal ediliyor...`, { txId, orderId });
+                    const cancelSuccess = await this.btcturk.cancelOrder(orderId);
 
-                    if (this.intervals.orderMonitoring) clearInterval(this.intervals.orderMonitoring);
-
-                    const filledAmount = amount;
-                    this.currentOrder.active = false;
-                    this.currentOrder.orderId = null;
-
-                    await this.executeCounterOrder(filledAmount, orderId, txId, expectedProfit);
-                    await this.updateBalances();
+                    if (cancelSuccess) {
+                        logger.info('✅ Kalan emir başarıyla iptal edildi.', { txId, orderId });
+                        // SADECE iptal başarılı olursa state'i temizle
+                        this.currentOrder.active = false;
+                        this.currentOrder.orderId = null;
+                        await this.updateBalances();
+                    } else {
+                        logger.error('CRITICAL: Kalan emir iptal edilemedi. Manuel kontrol gerekli!', { txId, orderId });
+                        // State'i temizleme, bot bir sonraki döngüde tekrar denesin
+                        this.startOrderMonitoring();
+                    }
+                } catch (cancelError) {
+                    logger.error('CRITICAL: Kalan emri iptal ederken hata oluştu.', { txId, orderId, error: cancelError.message });
+                    this.startOrderMonitoring();
                 }
+                return;
+            }
+
+        } catch (error) {
+            const errorMessage = error.message?.toLowerCase() || '';
+            if (errorMessage.includes('order not found')) {
+                logger.warn('Emir durumu sorgulanırken bulunamadı. Muhtemelen manuel iptal edildi. State temizleniyor.', { txId, orderId });
+                if (this.intervals.orderMonitoring) clearInterval(this.intervals.orderMonitoring);
+                this.currentOrder.active = false;
+                this.currentOrder.orderId = null;
+                this.updateBalances();
+            } else {
+                logger.error('❌ Emir durum kontrolü hatası', { txId, orderId, error: error.message });
+            }
+        }
+    }
+    async executeCounterOrder(overrideAmount = null, originalOrderId = null, txId = null, profit = 0, scenario = null) {
+        const amount = overrideAmount;
+        if (!amount || amount <= 0) {
+            logger.warn('⚠️ Counter order için geçersiz miktar, işlem atlanıyor', { txId, amount });
+            return false;
+        }
+
+        const binanceSide = scenario === 'SELL' ? 'BUY' : 'SELL';
+        const maxRetries = 3;
+        let attempt = 0;
+        let lastError = null;
+
+        while (attempt < maxRetries) {
+            try {
+                attempt++;
+                logger.info(`🔄 Karşı emir deneniyor (Attempt ${attempt}/${maxRetries})...`, { txId, originalOrderId, side: binanceSide, amount });
+
+                const counterOrder = await this.binance.createMarketOrder({
+                    symbol: 'XRPUSDT',
+                    side: binanceSide,
+                    quantity: amount
+                });
+
+                this.metrics.tradesSucceeded++;
+                this.metrics.totalProfit += profit;
+
+                logger.profit('🎉 Arbitraj döngüsü tamamlandı!', {
+                    txId,
+                    profit: `${profit.toFixed(4)} USDT`,
+                    totalProfit: `${this.metrics.totalProfit.toFixed(4)} USDT`,
+                    successfulTrades: this.metrics.tradesSucceeded,
+                    originalOrderId,
+                    counterOrderId: counterOrder.id,
+                });
+
+                notificationService.notifyTradeSuccess(txId, profit, this.metrics.totalProfit, this.metrics).catch(err =>
+                    logger.error('Telegram bildirimi gönderilemedi', { error: err.message })
+                );
+
+                // Başarılı olunca 2 saniye sonra yeni fırsat ara
+                setTimeout(() => this.checkArbitrageOpportunity(), 2000);
+                return true;
 
             } catch (error) {
-                const errorMessage = error.message?.toLowerCase() || '';
-                if (errorMessage.includes('order not found')) {
-                    logger.warn('Emir durumu sorgulanırken bulunamadı. State temizleniyor.', { txId, orderId });
-                    if (this.intervals.orderMonitoring) clearInterval(this.intervals.orderMonitoring);
-                    this.currentOrder.active = false;
-                    this.currentOrder.orderId = null;
-                    this.updateBalances();
-                } else {
-                    logger.error('❌ Emir durum kontrolü hatası', { txId, orderId, error: error.message });
+                lastError = error;
+                logger.error(`❌ Karşı emir denemesi ${attempt} başarısız oldu`, {
+                    txId, originalOrderId,
+                    error: error.message,
+                    isLastAttempt: attempt === maxRetries
+                });
+
+                if (attempt < maxRetries) {
+                    const delay = 1000 * Math.pow(2, attempt); // Exponential backoff: 2s, 4s
+                    logger.info(`${delay / 1000} saniye sonra tekrar denenecek...`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
                 }
             }
         }
-        
-            async executeCounterOrder(overrideAmount = null, originalOrderId = null, txId = null, profit = 0) {
-                try {
-                    const amount = overrideAmount;
-                    if (!amount || amount <= 0) {
-                        logger.warn('⚠️ Counter order için geçersiz miktar, işlem atlanıyor', { txId, amount });
-                        return false;
-                    }
-        
-                    logger.info('🔄 Counter order başlatılıyor...', { txId, originalOrderId, amount });
-        
-                    const scenario = this.currentOrder.scenario;
-                    const binanceSide = scenario === 'SELL' ? 'BUY' : 'SELL';
 
-                    // Faz 2: Counter order öncesi slippage kontrolü
-                    try {
-                        logger.info('🔍 Counter order için slippage kontrol ediliyor...', { txId, side: binanceSide });
-                        const slippageData = await this.engine.calculateExpectedSlippage(this.binance, binanceSide, amount);
-                        
-                        if (slippageData) {
-                            logger.info('📊 Counter order slippage:', {
-                                txId,
-                                side: binanceSide,
-                                slippage: slippageData.slippagePercent.toFixed(3) + '%',
-                                depthUsed: slippageData.levelsNeeded + ' seviye',
-                                avgPrice: slippageData.avgExecutionPrice
-                            });
+        // Tüm denemeler başarısız oldu
+        this.metrics.tradesFailed++;
+        const alertMessage = `🚨 KRİTİK HATA: Karşı emir ${maxRetries} deneme sonrası atılamadı!\nBorsa: Binance\nOrijinal Emir ID: ${originalOrderId}\nSon Hata: ${lastError.message}`;
+        notificationService.sendAlert(alertMessage);
 
-                            // Yüksek slippage uyarısı (>0.2%)
-                            if (slippageData.slippagePercent > 0.2) {
-                                logger.warn('⚠️ Yüksek slippage tespit edildi!', {
-                                    txId,
-                                    slippage: slippageData.slippagePercent.toFixed(3) + '%',
-                                    warning: 'Counter order yine de gerçekleştirilecek (hedge gerekli)'
-                                });
-                            }
-                        }
-                    } catch (slippageError) {
-                        logger.warn('⚠️ Slippage hesaplanamadı, counter order devam edecek:', {
-                            txId,
-                            error: slippageError.message
-                        });
-                    }
-        
-                    logger.info('📤 Binance market emri gönderiliyor...', { txId, side: binanceSide, amount });
-                    const counterOrder = await this.binance.createMarketOrder({
-                        symbol: 'XRPUSDT',
-                        side: binanceSide,
-                        quantity: amount
-                    });
-        
-                    this.metrics.tradesSucceeded++;
-                    this.metrics.totalProfit += profit;
-        
-                    logger.profit('🎉 Arbitraj döngüsü tamamlandı!', {
-                        txId,
-                        profit: `${profit.toFixed(4)} USDT`,
-                        totalProfit: `${this.metrics.totalProfit.toFixed(4)} USDT`,
-                        successfulTrades: this.metrics.tradesSucceeded,
-                        failedTrades: this.metrics.tradesFailed,
-                        originalOrderId,
-                        counterOrderId: counterOrder.id,
-                    });
+        logger.error('❌ CRITICAL: Karşı emir tüm denemelere rağmen başarısız oldu. Bot güvenli modda durduruluyor.', {
+            txId, originalOrderId,
+            error: lastError.message,
+            stack: lastError.stack
+        });
 
-                    // Telegram bildirimi - Trade başarılı (throttled)
-                    notificationService.notifyTradeSuccess(txId, profit, this.metrics.totalProfit, this.metrics).catch(err =>
-                        logger.error('Telegram bildirimi gönderilemedi', { error: err.message })
-                    );
+        // Güvenli moda geç
+        await this.enterSafeMode();
+        return false;
+    }
 
-                    setTimeout(() => this.checkArbitrageOpportunity(), 2000);
-                    return true;
+    /**
+     * Acil durumlarda botu güvenli bir şekilde durdurur.
+     */
+    async enterSafeMode() {
+        logger.fatal('🚨 GÜVENLİ MOD AKTİF EDİLDİ! Bot tüm işlemleri durduruyor.');
         
-                } catch (error) {
-                    this.metrics.tradesFailed++;
-                    const alertMessage = `🚨 KRİTİK HATA: Karşı emir atılamadı!\nBorsa: Binance\nOrijinal Emir ID: ${originalOrderId}\nSebep: ${error.message}`;
-                    notificationService.sendAlert(alertMessage);
+        // Tüm zamanlayıcıları temizle
+        Object.values(this.intervals).forEach(clearInterval);
+
+        // Olası açık emri iptal etmeyi dene (best-effort)
+        if (this.currentOrder.active && this.currentOrder.orderId) {
+            try {
+                logger.warn(`Güvenli mod: Açık emir ${this.currentOrder.orderId} iptal ediliyor...`);
+                await this.btcturk.cancelOrder(this.currentOrder.orderId);
+                logger.info('Açık emir iptal edildi.');
+            } catch (error) {
+                logger.error('Güvenli mod sırasında açık emir iptal edilemedi.', { error: error.message });
+            }
+        }
         
-                    logger.error('❌ Counter order hatası', {
-                        txId, originalOrderId,
-                        error: error.message,
-                        stack: error.stack
-                    });
-                    return false;
-                }
-            }    /**
+        // Bot'u resmi olarak durdur
+        await this.stop();
+    }
+
+	/**
      * Bot'u başlat
      */
     async start() {
