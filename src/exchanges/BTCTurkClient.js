@@ -495,6 +495,67 @@ class BTCTurkClient {
     }
 
     /**
+     * FAZ 2: Order Book Depth Sorgulama
+     * Order book'u alır ve depth analizi için hazırlar
+     * 
+     * @param {string} symbol - Trading pair (örn: 'XRPUSDT')
+     * @param {number} limit - Depth seviyesi (default: 20)
+     * @returns {Promise<object>} Order book data
+     */
+    async getOrderBook(symbol = 'XRPUSDT', limit = 20) {
+        try {
+            const url = new URL(`${this.baseURL}/api/v2/orderbook?pairSymbol=${symbol}&limit=${limit}`);
+            
+            return new Promise((resolve, reject) => {
+                https.get(url, (res) => {
+                    let data = '';
+                    
+                    res.on('data', (chunk) => {
+                        data += chunk;
+                    });
+                    
+                    res.on('end', () => {
+                        try {
+                            const response = JSON.parse(data);
+                            
+                            if (!response.data || !response.data.bids || !response.data.asks) {
+                                throw new Error('Invalid order book response');
+                            }
+                            
+                            // Bids ve asks'i parse et
+                            const bids = response.data.bids.map(b => ({
+                                price: parseFloat(b[0]),
+                                amount: parseFloat(b[1])
+                            }));
+                            
+                            const asks = response.data.asks.map(a => ({
+                                price: parseFloat(a[0]),
+                                amount: parseFloat(a[1])
+                            }));
+                            
+                            resolve({
+                                symbol,
+                                bids,
+                                asks,
+                                timestamp: response.data.timestamp || Date.now()
+                            });
+                        } catch (parseError) {
+                            logger.error('BTCTurk order book parse hatası:', parseError.message);
+                            reject(parseError);
+                        }
+                    });
+                }).on('error', (error) => {
+                    logger.error('BTCTurk order book hatası:', error.message);
+                    reject(error);
+                });
+            });
+        } catch (error) {
+            logger.error('BTCTurk order book hatası:', error.message);
+            throw error;
+        }
+    }
+
+    /**
      * Get order book
      */
     async getOrderBook(symbol = 'XRPTRY', limit = 10) {

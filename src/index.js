@@ -58,11 +58,11 @@ async function startBot() {
         logger.info('📝 Log dosyaları: logs/ klasörü');
         logger.info('⏸️  Durdurmak için CTRL+C kullanın');
         
-        // Periyodik durum raporu (her 5 dakikada)
+        // Periyodik durum raporu (her 1 dakikada)
         setInterval(() => {
             logger.info('📊 Periyodik Durum Raporu');
             bot.printStatus();
-        }, 300000); // 5 dakika
+        }, 60000); // 1 dakika
         
     } catch (error) {
         logger.error('❌ Bot başlatma hatası', {

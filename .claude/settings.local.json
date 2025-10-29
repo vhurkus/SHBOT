@@ -3,7 +3,18 @@
     "allow": [
       "Bash(node:*)",
       "WebFetch(domain:github.com)",
-      "Bash(dir:*)"
+      "Bash(dir:*)",
+      "Bash(rm:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$(cat <<''EOF''\nfeat: Add comprehensive Telegram notification system\n\n- Bot start/stop notifications with balance info\n- Trade success notifications (throttled every 10 trades)\n- Partial fill alerts\n- Low balance warnings (1 hour cooldown)\n- Connection loss alerts (30 min cooldown)\n- Price anomaly detection (10 min cooldown)\n- Daily summary reports at midnight\n- Initialization error notifications\n- Order cancellation alerts\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF\n)\")",
+      "Bash(git push:*)",
+      "WebSearch",
+      "WebFetch(domain:steemit.com)",
+      "WebFetch(domain:hankstoever.com)",
+      "WebFetch(domain:hummingbot.org)",
+      "WebFetch(domain:docs.hummingbot.io)",
+      "WebFetch(domain:hackmd.io)",
+      "WebFetch(domain:ehgp.github.io)"
     ],
     "deny": [],
     "ask": []

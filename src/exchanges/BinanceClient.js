@@ -610,6 +610,51 @@ class BinanceClient {
     }
 
     /**
+     * FAZ 2: Order Book Depth Sorgulama
+     * Order book'u alır ve depth analizi için hazırlar
+     * 
+     * @param {string} symbol - Trading pair (örn: 'XRPUSDT')
+     * @param {number} limit - Depth seviyesi (5, 10, 20, 50, 100, 500, 1000, 5000)
+     * @returns {Promise<object>} Order book data
+     */
+    async getOrderBook(symbol = 'XRPUSDT', limit = 20) {
+        try {
+            // Binance limit değerleri: 5, 10, 20, 50, 100, 500, 1000, 5000
+            const validLimits = [5, 10, 20, 50, 100, 500, 1000, 5000];
+            const closestLimit = validLimits.reduce((prev, curr) => 
+                Math.abs(curr - limit) < Math.abs(prev - limit) ? curr : prev
+            );
+            
+            const result = await this.makeRequest('GET', '/api/v3/depth', { 
+                symbol: symbol.toUpperCase(), 
+                limit: closestLimit 
+            }, false);
+            
+            // Bids ve asks'i parse et
+            const bids = result.bids.map(b => ({
+                price: parseFloat(b[0]),
+                amount: parseFloat(b[1])
+            }));
+            
+            const asks = result.asks.map(a => ({
+                price: parseFloat(a[0]),
+                amount: parseFloat(a[1])
+            }));
+            
+            return {
+                symbol: symbol.toUpperCase(),
+                bids,
+                asks,
+                timestamp: Date.now(),
+                lastUpdateId: result.lastUpdateId
+            };
+        } catch (error) {
+            logger.error(`Binance ${symbol} order book hatası:`, error.message);
+            throw error;
+        }
+    }
+
+    /**
      * Helper: Sleep function
      */
     sleep(ms) {

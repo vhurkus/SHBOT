@@ -93,6 +93,11 @@ class ArbitrageBot {
         // Debug için
         this.lastPriceCheckLog = 0;
         
+        // FAZ 1: Fiyat geçmişi tracking (volatilite hesaplama için)
+        this.priceHistory = [];
+        this.maxPriceHistorySize = 100; // Son 100 fiyat
+        this.volatilityUpdateCounter = 0; // Her 10 fiyat güncellemesinde volatilite hesapla
+        
         // Monitoring intervals
         this.intervals = {
             balanceUpdate: null,
@@ -337,7 +342,7 @@ class ArbitrageBot {
                 logger.warn(`[Data Validation] BTCTurk'ten geçersiz fiyat verisi geldi (bid > ask), atlanıyor.`, { bid: newBid, ask: newAsk });
                 return;
             }
-            const threshold = this.config.trading.safety.priceSanityCheckThreshold;
+            const threshold = config.trading.safety.priceSanityCheckThreshold;
             const oldPrice = this.prices.btcturk.ask;
             if (oldPrice && threshold > 0) {
                 const changePercent = Math.abs((newAsk - oldPrice) / oldPrice) * 100;
@@ -380,7 +385,7 @@ class ArbitrageBot {
                 logger.warn(`[Data Validation] Binance'ten geçersiz fiyat verisi geldi (bid > ask), atlanıyor.`, { bid: newBid, ask: newAsk });
                 return;
             }
-            const threshold = this.config.trading.safety.priceSanityCheckThreshold;
+            const threshold = config.trading.safety.priceSanityCheckThreshold;
             const oldPrice = this.prices.binance.ask;
             if (oldPrice && threshold > 0) {
                 const changePercent = Math.abs((newAsk - oldPrice) / oldPrice) * 100;
@@ -404,12 +409,65 @@ class ArbitrageBot {
                 timestamp: Date.now()
             };
             
+            // FAZ 1: Fiyat geçmişine ekle (volatilite hesaplama için)
+            this.priceHistory.push({
+                timestamp: Date.now(),
+                binanceBid: newBid,
+                binanceAsk: newAsk
+            });
+            
+            // Son N fiyatı tut (memory yönetimi)
+            if (this.priceHistory.length > this.maxPriceHistorySize) {
+                this.priceHistory.shift();
+            }
+            
+            // FAZ 1: Her 10 güncelleme (yaklaşık 30 saniye) volatilite hesapla ve parametreleri güncelle
+            this.volatilityUpdateCounter++;
+            if (this.volatilityUpdateCounter >= 10) {
+                this.volatilityUpdateCounter = 0;
+                this.updateVolatilityBasedParameters();
+            }
+            
             if (this.currentOrder.active && this.currentOrder.lastBinancePrice) {
                 this.checkPriceChange();
             }
             
             this.checkArbitrageOpportunity();
         }    
+    
+    /**
+     * FAZ 1: Volatilite bazlı parametreleri güncelle
+     * Her 10 fiyat güncellemesinde çağrılır (yaklaşık 30 saniye)
+     */
+    updateVolatilityBasedParameters() {
+        try {
+            // Yeterli fiyat verisi yoksa çık
+            if (this.priceHistory.length < 10) {
+                return;
+            }
+            
+            // Ask fiyatlarını al (SELL senaryosu için en önemli)
+            const askPrices = this.priceHistory.map(p => p.binanceAsk);
+            
+            // ArbitrageEngine'den dinamik parametreleri güncelle
+            const result = this.engine.updateDynamicParameters(askPrices, 20);
+            
+            // Sadece anlamlı değişiklik varsa log
+            if (result.updated) {
+                logger.info('✨ Volatilite bazlı parametre güncellemesi', {
+                    dataPoints: this.priceHistory.length,
+                    volatility: `${result.volatility.toFixed(4)}%`,
+                    newSpread: `${result.minSpread.toFixed(3)}%`,
+                    newProfit: `${result.minProfit.toFixed(3)}%`
+                });
+            }
+        } catch (error) {
+            logger.error('❌ Volatilite güncelleme hatası', {
+                error: error.message
+            });
+        }
+    }
+    
     /**
      * Fiyat değişimini kontrol et ve gerekirse emri güncelle
      * Sürekli açık emir stratejisi için kritik metod
@@ -440,14 +498,27 @@ class ArbitrageBot {
             const priceChange = Math.abs(currentBinancePrice - this.currentOrder.lastBinancePrice);
             const priceChangePercent = (priceChange / this.currentOrder.lastBinancePrice) * 100;
             
+            // FAZ 3: Dinamik threshold hesapla (volatiliteye göre)
+            let dynamicThreshold = this.config.priceUpdateThreshold; // Fallback sabit değer
+            
+            if (this.priceHistory && this.priceHistory.length >= 10) {
+                // Volatilite hesapla
+                const recentPrices = this.priceHistory.slice(-20).map(p => p.price);
+                const volatility = this.engine.calculateVolatility(recentPrices, recentPrices.length);
+                
+                // Dinamik threshold al
+                dynamicThreshold = this.engine.getDynamicUpdateThreshold(volatility);
+            }
+            
             // Threshold aşıldıysa emri güncelle
-            if (priceChangePercent >= this.config.priceUpdateThreshold) {
+            if (priceChangePercent >= dynamicThreshold) {
                 logger.info('📊 Fiyat değişimi eşiği aşıldı, emir güncelleniyor', {
                     scenario: this.currentOrder.scenario,
                     oldPrice: this.currentOrder.lastBinancePrice.toFixed(4),
                     newPrice: currentBinancePrice.toFixed(4),
-                    change: `${priceChangePercent.toFixed(2)}%`,
-                    threshold: `${this.config.priceUpdateThreshold}%`
+                    change: `${priceChangePercent.toFixed(3)}%`,
+                    threshold: `${dynamicThreshold.toFixed(3)}%`,
+                    type: dynamicThreshold === this.config.priceUpdateThreshold ? 'static' : 'dynamic'
                 });
                 
                 // Emri güncelle
@@ -757,6 +828,18 @@ class ArbitrageBot {
      * - XRP nerede ise o tarafa göre emir açılır
      * - Hazırlık gerekiyorsa önce hazırlık işlemi yapılır
      */
+    /**
+     * Helper: prices objesini ArbitrageEngine'in beklediği formata çevir
+     */
+    getFlatPrices() {
+        return {
+            btcturkBid: this.prices.btcturk.bid,
+            btcturkAsk: this.prices.btcturk.ask,
+            binanceBid: this.prices.binance.bid,
+            binanceAsk: this.prices.binance.ask
+        };
+    }
+
     async createNewOrder() {
         let scenario = null;
         let txId = null; // Task 5.1: Transaction ID
@@ -774,8 +857,11 @@ class ArbitrageBot {
                 return false;
             }
 
+            // Prices objesini düzleştir
+            const flatPrices = this.getFlatPrices();
+
             logger.info('🔍 Bakiye bazlı senaryo belirleniyor...', { txId });
-            const scenarioInfo = this.engine.determineScenario(this.balances, this.prices);
+            const scenarioInfo = this.engine.determineScenario(this.balances, flatPrices);
             if (!scenarioInfo.scenario) {
                 logger.warn('❌ Senaryo belirlenemedi', { txId, reason: scenarioInfo.reason });
                 return false;
@@ -783,7 +869,7 @@ class ArbitrageBot {
             scenario = scenarioInfo.scenario;
 
             logger.info(`[Task 4.4] Proaktif bakiye kontrolü yapılıyor (${scenario} senaryosu)...`, { txId });
-            const balanceValidation = this.engine.validateBalance(this.balances, scenario, this.prices);
+            const balanceValidation = this.engine.validateBalance(this.balances, scenario, flatPrices);
             if (!balanceValidation.valid) {
                 logger.warn('⚠️  Yetersiz bakiye nedeniyle emir oluşturulamadı (proaktif kontrol)', {
                     txId,
@@ -793,12 +879,46 @@ class ArbitrageBot {
                 return false;
             }
 
-            const profitability = this.engine.calculateProfitability(this.prices);
-            const profitScenario = scenario === 'SELL' ? profitability.sellScenario : profitability.buyScenario;
+            // Faz 2: Slippage kontrolü ile karlılık hesapla
+            logger.info('🔍 Slippage hesaplanıyor...', { txId });
+            let profitScenario;
+            try {
+                if (scenario === 'SELL') {
+                    const profitWithSlippage = await this.engine.calculateProfitability_Sell_WithSlippage_API(flatPrices, this.binance);
+                    profitScenario = profitWithSlippage; // Response kendisi scenario objesi
+                    const slippage = profitWithSlippage.binance && profitWithSlippage.binance.slippagePercent !== undefined 
+                        ? profitWithSlippage.binance.slippagePercent.toFixed(3) + '%' 
+                        : 'N/A';
+                    logger.info('📊 SELL Karlılık (Slippage dahil):', {
+                        txId,
+                        profit: profitWithSlippage.profit.percent.toFixed(3) + '%',
+                        slippage: slippage
+                    });
+                } else {
+                    const profitWithSlippage = await this.engine.calculateProfitability_Buy_WithSlippage_API(flatPrices, this.binance);
+                    profitScenario = profitWithSlippage; // Response kendisi scenario objesi
+                    const slippage = profitWithSlippage.binance && profitWithSlippage.binance.slippagePercent !== undefined 
+                        ? profitWithSlippage.binance.slippagePercent.toFixed(3) + '%' 
+                        : 'N/A';
+                    logger.info('📊 BUY Karlılık (Slippage dahil):', {
+                        txId,
+                        profit: profitWithSlippage.profit.percent.toFixed(3) + '%',
+                        slippage: slippage
+                    });
+                }
+            } catch (slippageError) {
+                logger.warn('⚠️  Slippage hesaplaması başarısız, basit karlılık kullanılıyor:', {
+                    txId,
+                    error: slippageError.message
+                });
+                const profitability = this.engine.calculateProfitability(flatPrices);
+                profitScenario = scenario === 'SELL' ? profitability.sellScenario : profitability.buyScenario;
+            }
+
             logger.info('📊 Piyasa durumu:', { txId, scenario, profitPercent: profitScenario.profit.percent.toFixed(2) + '%' });
 
             logger.info('💰 Emir fiyatı hesaplanıyor...', { txId });
-            const pricing = this.engine.calculateOrderPrice(this.prices, scenario, this.config.minProfit);
+            const pricing = this.engine.calculateOrderPrice(flatPrices, scenario, this.config.minProfit);
             const orderPrice = pricing.orderPrice;
             const orderAmount = roundToBTCTurkScale(this.config.tradeAmount, 4);
             const btcturkSide = scenario === 'SELL' ? 'sell' : 'buy';
@@ -957,6 +1077,36 @@ class ArbitrageBot {
         
                     const scenario = this.currentOrder.scenario;
                     const binanceSide = scenario === 'SELL' ? 'BUY' : 'SELL';
+
+                    // Faz 2: Counter order öncesi slippage kontrolü
+                    try {
+                        logger.info('🔍 Counter order için slippage kontrol ediliyor...', { txId, side: binanceSide });
+                        const slippageData = await this.engine.calculateExpectedSlippage(this.binance, binanceSide, amount);
+                        
+                        if (slippageData) {
+                            logger.info('📊 Counter order slippage:', {
+                                txId,
+                                side: binanceSide,
+                                slippage: slippageData.slippagePercent.toFixed(3) + '%',
+                                depthUsed: slippageData.levelsNeeded + ' seviye',
+                                avgPrice: slippageData.avgExecutionPrice
+                            });
+
+                            // Yüksek slippage uyarısı (>0.2%)
+                            if (slippageData.slippagePercent > 0.2) {
+                                logger.warn('⚠️ Yüksek slippage tespit edildi!', {
+                                    txId,
+                                    slippage: slippageData.slippagePercent.toFixed(3) + '%',
+                                    warning: 'Counter order yine de gerçekleştirilecek (hedge gerekli)'
+                                });
+                            }
+                        }
+                    } catch (slippageError) {
+                        logger.warn('⚠️ Slippage hesaplanamadı, counter order devam edecek:', {
+                            txId,
+                            error: slippageError.message
+                        });
+                    }
         
                     logger.info('📤 Binance market emri gönderiliyor...', { txId, side: binanceSide, amount });
                     const counterOrder = await this.binance.createMarketOrder({
@@ -1127,11 +1277,21 @@ class ArbitrageBot {
     printStatus() {
         const status = this.getStatus();
 
+        // Memory kullanımı (MB cinsinden)
+        const memUsage = process.memoryUsage();
+        const formatMemory = (bytes) => (bytes / 1024 / 1024).toFixed(2);
+
         console.log('\n' + '='.repeat(80));
         console.log('🤖 ARBITRAGE BOT STATUS');
         console.log('='.repeat(80));
         console.log(`\n⚙️  Durum: ${status.isRunning ? '▶️  ÇALIŞIYOR' : '⏸️  DURDU'}`);
         console.log(`📡 Initialize: ${status.isInitialized ? '✅' : '❌'}`);
+
+        console.log(`\n💾 Memory Kullanımı:`);
+        console.log(`  RSS (Total): ${formatMemory(memUsage.rss)} MB`);
+        console.log(`  Heap Used: ${formatMemory(memUsage.heapUsed)} MB / ${formatMemory(memUsage.heapTotal)} MB`);
+        console.log(`  External: ${formatMemory(memUsage.external)} MB`);
+
         console.log(`\n💼 Bakiyeler:`);
         console.log(`  BTCTurk: ${status.balances.btcturk.XRP.toFixed(2)} XRP, ${status.balances.btcturk.USDT.toFixed(2)} USDT`);
         console.log(`  Binance: ${status.balances.binance.XRP.toFixed(2)} XRP, ${status.balances.binance.USDT.toFixed(2)} USDT`);

@@ -132,6 +132,9 @@ const config = {
                 taker: getFloat('BINANCE_TAKER_FEE', 0.001)  // %0.1
             }
         },
+
+        // Slippage buffer (market emirler için)
+        slippageBuffer: getFloat('SLIPPAGE_BUFFER', 0.0005), // %0.05 (market order kayması için güvenlik marjı)
         
         // Decimal precision
         precision: {
