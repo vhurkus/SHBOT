@@ -9,6 +9,13 @@ import { roundToBinanceLOT_SIZE, roundToBTCTurkScale } from '../utils/precision.
 
 class ArbitrageEngine {
     constructor(options = {}) {
+        // ✅ ÇOKLU PARİTE DESTEĞİ: Parite config'i sakla
+        this.pairConfig = options.pairConfig || null;
+
+        if (!this.pairConfig) {
+            throw new Error('❌ pairConfig gerekli! options.pairConfig parametresi eksik.');
+        }
+
         // Exchange fee'leri (config'den veya manual)
         this.fees = {
             btcturk: {
@@ -28,15 +35,16 @@ class ArbitrageEngine {
         this.minSpread = options.minSpread || config.trading.minSpread;
         this.minProfit = options.minProfit || config.trading.minProfit;
 
-        // Trade amount (XRP cinsinden)
-        this.tradeAmount = options.tradeAmount || config.trading.tradeAmount;
+        // Trade amount (dinamik coin - AVAX/XRP/SOL)
+        this.tradeAmount = options.tradeAmount || this.pairConfig.tradeAmount;
 
         logger.info('🤖 ArbitrageEngine başlatıldı', {
+            pair: this.pairConfig.symbol,
             fees: this.fees,
             slippageBuffer: `${(this.slippageBuffer * 100).toFixed(3)}%`,
             minSpread: `${this.minSpread}%`,
             minProfit: `${this.minProfit}%`,
-            tradeAmount: `${this.tradeAmount} XRP`
+            tradeAmount: `${this.tradeAmount} ${this.pairConfig.baseCoin}`
         });
     }
 
@@ -76,7 +84,7 @@ class ArbitrageEngine {
      */
     updateTradeAmount(amount) {
         this.tradeAmount = amount;
-        logger.info(`📦 Trade amount güncellendi: ${amount} XRP`);
+        logger.info(`📦 Trade amount güncellendi: ${amount} ${this.pairConfig.baseCoin}`);
     }
 
     /**
@@ -181,17 +189,17 @@ class ArbitrageEngine {
      * @returns {number} Önerilen minimum kar (%)
      */
     getDynamicMinProfit(currentVolatility, currentSpread) {
-        const baseProfitRatio = 0.5; // Spread'in %50'si kar olsun
+        const baseProfitRatio = 0.3; // ✅ Spread'in %30'u kar (daha agresif)
         const volatilityAdjustment = currentVolatility * 0.3; // Volatiliteye göre artış
         
-        // Minimum kar = Spread'in yarısı + volatilite eklentisi
+        // Minimum kar = Spread'in %30'u + volatilite eklentisi
         let minProfit = (currentSpread * baseProfitRatio) + volatilityAdjustment;
         
-        // Minimumda %0.10 kar garantisi
-        minProfit = Math.max(minProfit, 0.10);
+        // ✅ DÜZELTME: Minimumda %0.03 kar garantisi (çok daha agresif)
+        minProfit = Math.max(minProfit, 0.03);
         
-        // Maksimum %0.50 kar hedefi (çok yüksek hedef fırsat kaybettirir)
-        minProfit = Math.min(minProfit, 0.50);
+        // Maksimum %0.30 kar hedefi (daha agresif, fırsatları kaçırmamak için)
+        minProfit = Math.min(minProfit, 0.30);
         
         return parseFloat(minProfit.toFixed(4));
     }
@@ -368,7 +376,7 @@ class ArbitrageEngine {
     async calculateProfitability_Sell_WithSlippage_API(prices, binanceClient, amount = this.tradeAmount) {
         try {
             // Order book al
-            const orderBook = await binanceClient.getOrderBook('XRPUSDT', 20);
+            const orderBook = await binanceClient.getOrderBook(this.pairConfig.symbol, 20);
             
             // Slippage dahil karlılık hesapla
             return this.calculateProfitability_Sell_WithSlippage(
@@ -389,7 +397,7 @@ class ArbitrageEngine {
     async calculateProfitability_Buy_WithSlippage_API(prices, binanceClient, amount = this.tradeAmount) {
         try {
             // Order book al
-            const orderBook = await binanceClient.getOrderBook('XRPUSDT', 20);
+            const orderBook = await binanceClient.getOrderBook(this.pairConfig.symbol, 20);
             
             // Slippage dahil karlılık hesapla
             return this.calculateProfitability_Buy_WithSlippage(
@@ -406,7 +414,7 @@ class ArbitrageEngine {
     async calculateExpectedSlippage(binanceClient, side, amount) {
         try {
             // Order book al
-            const orderBook = await binanceClient.getOrderBook('XRPUSDT', 20);
+            const orderBook = await binanceClient.getOrderBook(this.pairConfig.symbol, 20);
             
             // Side'a göre book seç (BUY için asks, SELL için bids)
             const book = side === 'BUY' ? orderBook.asks : orderBook.bids;
@@ -931,42 +939,43 @@ class ArbitrageEngine {
      * @returns {object} Emir yönü ve detayları
      */
     determineOrderSide(balances, prices = null) {
-        const btcturkXRP = balances.btcturk.XRP || 0;
-        const binanceXRP = balances.binance.XRP || 0;
+        const baseCoin = this.pairConfig.baseCoin;
+        const btcturkBase = balances.btcturk[baseCoin] || 0;
+        const binanceBase = balances.binance[baseCoin] || 0;
         const btcturkUSDT = balances.btcturk.USDT || 0;
         const binanceUSDT = balances.binance.USDT || 0;
 
-        // Trade için yeterli XRP var mı kontrol
-        const hasBtcturkXRP = btcturkXRP >= this.tradeAmount;
-        const hasBinanceXRP = binanceXRP >= this.tradeAmount;
+        // Trade için yeterli baseCoin var mı kontrol
+        const hasBtcturkBase = btcturkBase >= this.tradeAmount;
+        const hasBinanceBase = binanceBase >= this.tradeAmount;
 
         logger.info('💼 Bakiye kontrolü yapılıyor', {
             btcturk: {
-                XRP: btcturkXRP.toFixed(2),
+                [baseCoin]: btcturkBase.toFixed(2),
                 USDT: btcturkUSDT.toFixed(2),
-                hasEnoughXRP: hasBtcturkXRP
+                [`hasEnough${baseCoin}`]: hasBtcturkBase
             },
             binance: {
-                XRP: binanceXRP.toFixed(2),
+                [baseCoin]: binanceBase.toFixed(2),
                 USDT: binanceUSDT.toFixed(2),
-                hasEnoughXRP: hasBinanceXRP
+                [`hasEnough${baseCoin}`]: hasBinanceBase
             },
-            requiredXRP: this.tradeAmount
+            [`required${baseCoin}`]: this.tradeAmount
         });
 
-        // Hiçbir yerde yeterli XRP yok
-        if (!hasBtcturkXRP && !hasBinanceXRP) {
+        // Hiçbir yerde yeterli baseCoin yok
+        if (!hasBtcturkBase && !hasBinanceBase) {
             return {
                 possible: false,
-                reason: 'Insufficient XRP balance on both exchanges',
-                btcturkXRP,
-                binanceXRP,
-                requiredXRP: this.tradeAmount
+                reason: `Insufficient ${baseCoin} balance on both exchanges`,
+                [`btcturk${baseCoin}`]: btcturkBase,
+                [`binance${baseCoin}`]: binanceBase,
+                [`required${baseCoin}`]: this.tradeAmount
             };
         }
 
-        // Sadece BTCTurk'te XRP var → SELL senaryosu
-        if (hasBtcturkXRP && !hasBinanceXRP) {
+        // Sadece BTCTurk'te baseCoin var → SELL senaryosu
+        if (hasBtcturkBase && !hasBinanceBase) {
             // Binance'te USDT kontrolü
             const requiredUSDT = this.calculateRequiredBalance('BUY', prices?.binanceAsk || 0);
             const hasEnoughUSDT = binanceUSDT >= requiredUSDT;
@@ -976,17 +985,17 @@ class ArbitrageEngine {
                 scenario: 'SELL',
                 btcturkSide: 'SELL',
                 binanceSide: 'BUY',
-                reason: hasBtcturkXRP ? 'XRP only available on BTCTurk' : 'Insufficient USDT on Binance',
+                reason: hasBtcturkBase ? `${baseCoin} only available on BTCTurk` : 'Insufficient USDT on Binance',
                 balances: {
-                    btcturkXRP,
+                    [`btcturk${baseCoin}`]: btcturkBase,
                     binanceUSDT,
                     requiredUSDT
                 }
             };
         }
 
-        // Sadece Binance'te XRP var → BUY senaryosu
-        if (!hasBtcturkXRP && hasBinanceXRP) {
+        // Sadece Binance'te baseCoin var → BUY senaryosu
+        if (!hasBtcturkBase && hasBinanceBase) {
             // BTCTurk'te USDT kontrolü
             const requiredUSDT = this.calculateRequiredBalance('SELL', prices?.btcturkAsk || 0);
             const hasEnoughUSDT = btcturkUSDT >= requiredUSDT;
@@ -996,17 +1005,17 @@ class ArbitrageEngine {
                 scenario: 'BUY',
                 btcturkSide: 'BUY',
                 binanceSide: 'SELL',
-                reason: hasBinanceXRP ? 'XRP only available on Binance' : 'Insufficient USDT on BTCTurk',
+                reason: hasBinanceBase ? `${baseCoin} only available on Binance` : 'Insufficient USDT on BTCTurk',
                 balances: {
-                    binanceXRP,
+                    [`binance${baseCoin}`]: binanceBase,
                     btcturkUSDT,
                     requiredUSDT
                 }
             };
         }
 
-        // Her iki borsada da XRP var → En karlı senaryoya göre
-        if (hasBtcturkXRP && hasBinanceXRP && prices) {
+        // Her iki borsada da baseCoin var → En karlı senaryoya göre
+        if (hasBtcturkBase && hasBinanceBase && prices) {
             const profitability = this.calculateProfitability(prices);
             const bestScenario = profitability.bestScenario.scenario;
 
@@ -1022,7 +1031,7 @@ class ArbitrageEngine {
                     reason: 'SELL scenario is more profitable',
                     profitability: profitability.bestScenario.profit,
                     balances: {
-                        btcturkXRP,
+                        [`btcturk${baseCoin}`]: btcturkBase,
                         binanceUSDT,
                         requiredUSDT
                     }
@@ -1039,7 +1048,7 @@ class ArbitrageEngine {
                     reason: 'BUY scenario is more profitable',
                     profitability: profitability.bestScenario.profit,
                     balances: {
-                        binanceXRP,
+                        [`binance${baseCoin}`]: binanceBase,
                         btcturkUSDT,
                         requiredUSDT
                     }
@@ -1047,14 +1056,14 @@ class ArbitrageEngine {
             }
         }
 
-        // Fiyat bilgisi olmadan her iki tarafta da XRP var
+        // Fiyat bilgisi olmadan her iki tarafta da baseCoin var
         return {
             possible: true,
             scenario: 'BOTH_AVAILABLE',
-            reason: 'XRP available on both exchanges, need prices to determine best scenario',
+            reason: `${baseCoin} available on both exchanges, need prices to determine best scenario`,
             balances: {
-                btcturkXRP,
-                binanceXRP,
+                [`btcturk${baseCoin}`]: btcturkBase,
+                [`binance${baseCoin}`]: binanceBase,
                 btcturkUSDT,
                 binanceUSDT
             }
@@ -1094,9 +1103,11 @@ class ArbitrageEngine {
      * @returns {object} Validasyon sonucu
      */
     validateBalance(balances, scenario, prices) {
+        const baseCoin = this.pairConfig.baseCoin;
+
         if (scenario === 'SELL') {
-            // BTCTurk'te XRP, Binance'te USDT kontrolü
-            const hasXRP = balances.btcturk.XRP >= this.tradeAmount;
+            // BTCTurk'te baseCoin, Binance'te USDT kontrolü
+            const hasBaseCoin = balances.btcturk[baseCoin] >= this.tradeAmount;
 
             // Fiyat kontrolü
             if (!prices || !prices.binanceAsk || prices.binanceAsk <= 0) {
@@ -1112,13 +1123,13 @@ class ArbitrageEngine {
             const hasUSDT = balances.binance.USDT >= requiredUSDT;
 
             return {
-                valid: hasXRP && hasUSDT,
+                valid: hasBaseCoin && hasUSDT,
                 scenario: 'SELL',
                 checks: {
-                    btcturkXRP: {
+                    [`btcturk${baseCoin}`]: {
                         required: this.tradeAmount,
-                        available: balances.btcturk.XRP,
-                        sufficient: hasXRP
+                        available: balances.btcturk[baseCoin],
+                        sufficient: hasBaseCoin
                     },
                     binanceUSDT: {
                         required: requiredUSDT,
@@ -1126,13 +1137,13 @@ class ArbitrageEngine {
                         sufficient: hasUSDT
                     }
                 },
-                reason: !hasXRP ? 'Insufficient XRP on BTCTurk' : 
-                        !hasUSDT ? 'Insufficient USDT on Binance' : 
+                reason: !hasBaseCoin ? `Insufficient ${baseCoin} on BTCTurk` :
+                        !hasUSDT ? 'Insufficient USDT on Binance' :
                         'Balance validation passed'
             };
         } else if (scenario === 'BUY') {
-            // Binance'te XRP, BTCTurk'te USDT kontrolü
-            const hasXRP = balances.binance.XRP >= this.tradeAmount;
+            // Binance'te baseCoin, BTCTurk'te USDT kontrolü
+            const hasBaseCoin = balances.binance[baseCoin] >= this.tradeAmount;
 
             // Fiyat kontrolü
             if (!prices || !prices.btcturkAsk || prices.btcturkAsk <= 0) {
@@ -1148,13 +1159,13 @@ class ArbitrageEngine {
             const hasUSDT = balances.btcturk.USDT >= requiredUSDT;
 
             return {
-                valid: hasXRP && hasUSDT,
+                valid: hasBaseCoin && hasUSDT,
                 scenario: 'BUY',
                 checks: {
-                    binanceXRP: {
+                    [`binance${baseCoin}`]: {
                         required: this.tradeAmount,
-                        available: balances.binance.XRP,
-                        sufficient: hasXRP
+                        available: balances.binance[baseCoin],
+                        sufficient: hasBaseCoin
                     },
                     btcturkUSDT: {
                         required: requiredUSDT,
@@ -1162,8 +1173,8 @@ class ArbitrageEngine {
                         sufficient: hasUSDT
                     }
                 },
-                reason: !hasXRP ? 'Insufficient XRP on Binance' : 
-                        !hasUSDT ? 'Insufficient USDT on BTCTurk' : 
+                reason: !hasBaseCoin ? `Insufficient ${baseCoin} on Binance` :
+                        !hasUSDT ? 'Insufficient USDT on BTCTurk' :
                         'Balance validation passed'
             };
         }
@@ -1206,52 +1217,53 @@ class ArbitrageEngine {
      * @returns {object} Senaryo bilgisi
      */
     determineScenario(balances, prices) {
-        const btcturkXRP = balances.btcturk.XRP;
-        const binanceXRP = balances.binance.XRP;
+        const baseCoin = this.pairConfig.baseCoin;
+        const btcturkBase = balances.btcturk[baseCoin];
+        const binanceBase = balances.binance[baseCoin];
         const btcturkUSDT = balances.btcturk.USDT;
         const binanceUSDT = balances.binance.USDT;
         const tradeAmount = this.tradeAmount;
-        const tolerance = 0.1; // Binance LOT_SIZE minimum (stepSize)
+        const tolerance = this.pairConfig.binance.stepSize; // Binance LOT_SIZE minimum (stepSize - dinamik)
 
-        // Durum 1: XRP sadece BTCTurk'te var (>= tradeAmount - tolerance)
-        if (btcturkXRP >= (tradeAmount - tolerance) && binanceXRP < (tradeAmount - tolerance)) {
-            logger.info('📊 Senaryo: XRP BTCTurk\'te → SELL senaryosu');
+        // Durum 1: baseCoin sadece BTCTurk'te var (>= tradeAmount - tolerance)
+        if (btcturkBase >= (tradeAmount - tolerance) && binanceBase < (tradeAmount - tolerance)) {
+            logger.info(`📊 Senaryo: ${baseCoin} BTCTurk'te → SELL senaryosu`);
             return {
                 scenario: 'SELL',
                 btcturkSide: 'sell',
                 binanceSide: 'buy',
                 needsPreparation: false,
-                reason: 'XRP available on BTCTurk',
+                reason: `${baseCoin} available on BTCTurk`,
                 balances: {
-                    btcturkXRP,
-                    binanceXRP,
+                    [`btcturk${baseCoin}`]: btcturkBase,
+                    [`binance${baseCoin}`]: binanceBase,
                     btcturkUSDT,
                     binanceUSDT
                 }
             };
         }
 
-        // Durum 2: XRP sadece Binance'te var (>= tradeAmount - tolerance)
-        if (binanceXRP >= (tradeAmount - tolerance) && btcturkXRP < (tradeAmount - tolerance)) {
-            logger.info('📊 Senaryo: XRP Binance\'te → BUY senaryosu');
+        // Durum 2: baseCoin sadece Binance'te var (>= tradeAmount - tolerance)
+        if (binanceBase >= (tradeAmount - tolerance) && btcturkBase < (tradeAmount - tolerance)) {
+            logger.info(`📊 Senaryo: ${baseCoin} Binance'te → BUY senaryosu`);
             return {
                 scenario: 'BUY',
                 btcturkSide: 'buy',
                 binanceSide: 'sell',
                 needsPreparation: false,
-                reason: 'XRP available on Binance',
+                reason: `${baseCoin} available on Binance`,
                 balances: {
-                    btcturkXRP,
-                    binanceXRP,
+                    [`btcturk${baseCoin}`]: btcturkBase,
+                    [`binance${baseCoin}`]: binanceBase,
                     btcturkUSDT,
                     binanceUSDT
                 }
             };
         }
 
-        // Durum 3: Her iki borsada da XRP YOK (< tradeAmount - tolerance)
-        if (btcturkXRP < (tradeAmount - tolerance) && binanceXRP < (tradeAmount - tolerance)) {
-            logger.info('📊 Senaryo: Her iki borsada da XRP yok → Hazırlık gerekli');
+        // Durum 3: Her iki borsada da baseCoin YOK (< tradeAmount - tolerance)
+        if (btcturkBase < (tradeAmount - tolerance) && binanceBase < (tradeAmount - tolerance)) {
+            logger.info(`📊 Senaryo: Her iki borsada da ${baseCoin} yok → Hazırlık gerekli`);
 
             // Binance'te yeterli USDT var mı?
             const estimatedCost = tradeAmount * prices.binanceAsk * (1 + this.fees.binance.taker);
@@ -1266,8 +1278,8 @@ class ArbitrageEngine {
                     requiredUSDT: estimatedCost,
                     availableUSDT: binanceUSDT,
                     balances: {
-                        btcturkXRP,
-                        binanceXRP,
+                        [`btcturk${baseCoin}`]: btcturkBase,
+                        [`binance${baseCoin}`]: binanceBase,
                         btcturkUSDT,
                         binanceUSDT
                     }
@@ -1284,22 +1296,22 @@ class ArbitrageEngine {
                 preparationDetails: {
                     exchange: 'Binance',
                     side: 'BUY',
-                    amount: roundToBinanceLOT_SIZE(tradeAmount, 0.1), // XRPUSDT stepSize: 0.1
+                    amount: roundToBinanceLOT_SIZE(tradeAmount, this.pairConfig.binance.stepSize), // Dinamik stepSize
                     reason: 'Initialize arbitrage cycle with BUY on Binance (lower fees)'
                 },
-                reason: 'No XRP on either exchange, need to buy on Binance first',
+                reason: `No ${baseCoin} on either exchange, need to buy on Binance first`,
                 balances: {
-                    btcturkXRP,
-                    binanceXRP,
+                    [`btcturk${baseCoin}`]: btcturkBase,
+                    [`binance${baseCoin}`]: binanceBase,
                     btcturkUSDT,
                     binanceUSDT
                 }
             };
         }
 
-        // Durum 4: Her iki borsada da XRP VAR (>= tradeAmount - tolerance)
-        if (btcturkXRP >= (tradeAmount - tolerance) && binanceXRP >= (tradeAmount - tolerance)) {
-            logger.info('📊 Senaryo: Her iki borsada da XRP var → Binance\'i boşalt');
+        // Durum 4: Her iki borsada da baseCoin VAR (>= tradeAmount - tolerance)
+        if (btcturkBase >= (tradeAmount - tolerance) && binanceBase >= (tradeAmount - tolerance)) {
+            logger.info(`📊 Senaryo: Her iki borsada da ${baseCoin} var → Binance'i boşalt`);
 
             return {
                 scenario: 'SELL', // Hedef senaryo (hazırlık sonrası)
@@ -1311,13 +1323,13 @@ class ArbitrageEngine {
                 preparationDetails: {
                     exchange: 'Binance',
                     side: 'SELL',
-                    amount: roundToBinanceLOT_SIZE(binanceXRP, 0.1), // XRPUSDT stepSize: 0.1
-                    reason: 'Clear Binance XRP to maintain single-sided balance'
+                    amount: roundToBinanceLOT_SIZE(binanceBase, this.pairConfig.binance.stepSize), // Dinamik stepSize
+                    reason: `Clear Binance ${baseCoin} to maintain single-sided balance`
                 },
-                reason: 'XRP on both exchanges, consolidate to BTCTurk for SELL cycle',
+                reason: `${baseCoin} on both exchanges, consolidate to BTCTurk for SELL cycle`,
                 balances: {
-                    btcturkXRP,
-                    binanceXRP,
+                    [`btcturk${baseCoin}`]: btcturkBase,
+                    [`binance${baseCoin}`]: binanceBase,
                     btcturkUSDT,
                     binanceUSDT
                 }
@@ -1352,7 +1364,8 @@ class ArbitrageEngine {
         console.log(`  Binance Maker: ${(this.fees.binance.maker * 100).toFixed(2)}%`);
         console.log(`  Binance Taker: ${(this.fees.binance.taker * 100).toFixed(2)}%`);
         console.log('\n💰 Trading Parameters:');
-        console.log(`  Trade Amount: ${this.tradeAmount} XRP`);
+        console.log(`  Pair: ${this.pairConfig.symbol}`);
+        console.log(`  Trade Amount: ${this.tradeAmount} ${this.pairConfig.baseCoin}`);
         console.log(`  Min Spread: ${this.minSpread}%`);
         console.log(`  Min Profit: ${this.minProfit}%`);
         console.log('\n' + '='.repeat(60) + '\n');

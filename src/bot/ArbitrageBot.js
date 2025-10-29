@@ -13,13 +13,20 @@ import notificationService from '../utils/NotificationService.js';
 
 class ArbitrageBot {
     constructor(options = {}, clients = {}) {
+        // ✅ ÇOKLU PARİTE DESTEĞİ: Parite config'i sakla
+        this.pairConfig = options.pairConfig || null;
+
+        if (!this.pairConfig) {
+            throw new Error('❌ pairConfig gerekli! options.pairConfig parametresi eksik.');
+        }
+
         // Exchange clients
         this.btcturk = clients.btcturk || null;
         this.binance = clients.binance || null;
-        
+
         // Arbitrage engine
         this.engine = null;
-        
+
         // Bot durumu
         this.isRunning = false;
         this.isInitialized = false;
@@ -40,22 +47,23 @@ class ArbitrageBot {
             }
         };
         
-        // Bakiye state
+        // Bakiye state (dinamik coin desteği)
+        const baseCoin = this.pairConfig.baseCoin;
         this.balances = {
             btcturk: {
-                XRP: 0,
+                [baseCoin]: 0,
                 USDT: 0,
-                lockedXRP: 0,
+                [`locked${baseCoin}`]: 0,
                 lockedUSDT: 0,
-                totalXRP: 0,
+                [`total${baseCoin}`]: 0,
                 totalUSDT: 0
             },
             binance: {
-                XRP: 0,
+                [baseCoin]: 0,
                 USDT: 0,
-                lockedXRP: 0,
+                [`locked${baseCoin}`]: 0,
                 lockedUSDT: 0,
-                totalXRP: 0,
+                [`total${baseCoin}`]: 0,
                 totalUSDT: 0
             }
         };
@@ -105,19 +113,23 @@ class ArbitrageBot {
             priceUpdate: null
         };
         
-        // Konfigürasyon
+        // Konfigürasyon - pairConfig'den alınıyor
         this.config = {
-            symbol: options.symbol || config.trading.symbol,
-            tradeAmount: options.tradeAmount || config.trading.tradeAmount,
-            minProfit: options.minProfit || config.trading.minProfit,
-            minSpread: options.minSpread || config.trading.minSpread,
+            symbol: this.pairConfig.symbol,
+            baseCoin: this.pairConfig.baseCoin,
+            quoteCoin: this.pairConfig.quoteCoin,
+            tradeAmount: this.pairConfig.tradeAmount,
+            minProfit: this.pairConfig.minProfit,
+            minSpread: this.pairConfig.minSpread,
             balanceUpdateInterval: options.balanceUpdateInterval || 30000,  // 30 saniye
             orderCheckInterval: options.orderCheckInterval || 1000,         // 1 saniye
-            priceUpdateThreshold: options.priceUpdateThreshold || config.trading.priceUpdateThreshold || 0.2
+            priceUpdateThreshold: this.pairConfig.priceUpdateThreshold
         };
-        
+
         logger.info('🤖 ArbitrageBot oluşturuldu', {
             symbol: this.config.symbol,
+            baseCoin: this.config.baseCoin,
+            quoteCoin: this.config.quoteCoin,
             tradeAmount: this.config.tradeAmount,
             minProfit: `${this.config.minProfit}%`,
             minSpread: `${this.config.minSpread}%`
@@ -160,9 +172,10 @@ class ArbitrageBot {
             logger.info('🕐 Binance server time senkronize ediliyor...');
             await this.binance.syncServerTime();
 
-            // 2. ArbitrageEngine'i oluştur
+            // 2. ArbitrageEngine'i oluştur - pairConfig ile
             logger.info('⚙️  ArbitrageEngine başlatılıyor...');
             this.engine = new ArbitrageEngine({
+                pairConfig: this.pairConfig,  // ✅ Parite config'i gönder
                 tradeAmount: this.config.tradeAmount,
                 minProfit: this.config.minProfit,
                 minSpread: this.config.minSpread
@@ -208,17 +221,17 @@ class ArbitrageBot {
      */
     async testConnections() {
         try {
-            // BTCTurk test
-            const btcturkTest = await this.btcturk.getTicker24h('XRPUSDT');
+            // BTCTurk test - dinamik symbol
+            const btcturkTest = await this.btcturk.getTicker24h(this.config.symbol);
             logger.info('✅ BTCTurk API bağlantısı başarılı', {
-                symbol: 'XRPUSDT',
+                symbol: this.config.symbol,
                 last: btcturkTest.last
             });
-            
-            // Binance test
-            const binanceTest = await this.binance.getTicker24h('XRPUSDT');
+
+            // Binance test - dinamik symbol
+            const binanceTest = await this.binance.getTicker24h(this.config.symbol);
             logger.info('✅ Binance API bağlantısı başarılı', {
-                symbol: 'XRPUSDT',
+                symbol: this.config.symbol,
                 lastPrice: binanceTest.lastPrice
             });
             
@@ -243,45 +256,46 @@ class ArbitrageBot {
             ]);
             
             // BTCTurk response'u object olarak geldiği için direkt kullan
-            // Format: { XRP: { free, locked, total }, USDT: { free, locked, total } }
-            const btcturkXRP = btcturkResp.XRP || { free: 0, locked: 0, total: 0 };
+            // Format: { AVAX/XRP/SOL: { free, locked, total }, USDT: { free, locked, total } }
+            const baseCoin = this.config.baseCoin;
+            const btcturkBase = btcturkResp[baseCoin] || { free: 0, locked: 0, total: 0 };
             const btcturkUSDT = btcturkResp.USDT || { free: 0, locked: 0, total: 0 };
-            
+
             // BTCTurk bakiyeleri
-            const btcturkXRPFree = parseFloat(btcturkXRP.free || 0);
-            const btcturkXRPLocked = parseFloat(btcturkXRP.locked || 0);
+            const btcturkBaseFree = parseFloat(btcturkBase.free || 0);
+            const btcturkBaseLocked = parseFloat(btcturkBase.locked || 0);
             const btcturkUSDTFree = parseFloat(btcturkUSDT.free || 0);
             const btcturkUSDTLocked = parseFloat(btcturkUSDT.locked || 0);
-            
+
             this.balances.btcturk = {
-                XRP: btcturkXRPFree,
+                [baseCoin]: btcturkBaseFree,
                 USDT: btcturkUSDTFree,
-                lockedXRP: btcturkXRPLocked,
+                [`locked${baseCoin}`]: btcturkBaseLocked,
                 lockedUSDT: btcturkUSDTLocked,
-                totalXRP: btcturkXRPFree + btcturkXRPLocked,
+                [`total${baseCoin}`]: btcturkBaseFree + btcturkBaseLocked,
                 totalUSDT: btcturkUSDTFree + btcturkUSDTLocked
             };
-            
+
             // Binance response'u object olarak geldiği için direkt kullan
-            const binanceXRP = binanceResp.XRP || { free: 0, locked: 0, total: 0 };
+            const binanceBase = binanceResp[baseCoin] || { free: 0, locked: 0, total: 0 };
             const binanceUSDT = binanceResp.USDT || { free: 0, locked: 0, total: 0 };
-            
+
             this.balances.binance = {
-                XRP: parseFloat(binanceXRP.free || 0),
+                [baseCoin]: parseFloat(binanceBase.free || 0),
                 USDT: parseFloat(binanceUSDT.free || 0),
-                lockedXRP: parseFloat(binanceXRP.locked || 0),
+                [`locked${baseCoin}`]: parseFloat(binanceBase.locked || 0),
                 lockedUSDT: parseFloat(binanceUSDT.locked || 0),
-                totalXRP: parseFloat(binanceXRP.free || 0) + parseFloat(binanceXRP.locked || 0),
+                [`total${baseCoin}`]: parseFloat(binanceBase.free || 0) + parseFloat(binanceBase.locked || 0),
                 totalUSDT: parseFloat(binanceUSDT.free || 0) + parseFloat(binanceUSDT.locked || 0)
             };
             
             logger.info('💼 Bakiyeler güncellendi', {
                 btcturk: {
-                    XRP: `${this.balances.btcturk.XRP.toFixed(2)} (${this.balances.btcturk.lockedXRP.toFixed(2)} locked)`,
+                    [baseCoin]: `${this.balances.btcturk[baseCoin].toFixed(2)} (${this.balances.btcturk[`locked${baseCoin}`].toFixed(2)} locked)`,
                     USDT: `${this.balances.btcturk.USDT.toFixed(2)} (${this.balances.btcturk.lockedUSDT.toFixed(2)} locked)`
                 },
                 binance: {
-                    XRP: `${this.balances.binance.XRP.toFixed(2)} (${this.balances.binance.lockedXRP.toFixed(2)} locked)`,
+                    [baseCoin]: `${this.balances.binance[baseCoin].toFixed(2)} (${this.balances.binance[`locked${baseCoin}`].toFixed(2)} locked)`,
                     USDT: `${this.balances.binance.USDT.toFixed(2)} (${this.balances.binance.lockedUSDT.toFixed(2)} locked)`
                 }
             });
@@ -303,19 +317,19 @@ class ArbitrageBot {
      */
     async setupWebSockets() {
         try {
-            // BTCTurk WebSocket - XRPUSDT ticker
+            // BTCTurk WebSocket - dinamik symbol
             await this.btcturk.connectWebSocket((data) => {
                 this.onBTCTurkPriceUpdate(data);
-            }, 'XRPUSDT');
-            
-            logger.info('✅ BTCTurk WebSocket bağlandı (XRPUSDT)');
-            
-            // Binance WebSocket - XRPUSDT bookTicker
+            }, this.config.symbol);
+
+            logger.info(`✅ BTCTurk WebSocket bağlandı (${this.config.symbol})`);
+
+            // Binance WebSocket - dinamik symbol (lowercase)
             await this.binance.connectWebSocket((data) => {
                 this.onBinancePriceUpdate(data);
             });
-            
-            logger.info('✅ Binance WebSocket bağlandı (XRPUSDT)');
+
+            logger.info(`✅ Binance WebSocket bağlandı (${this.config.symbol})`);
             
             return true;
         } catch (error) {
@@ -536,8 +550,8 @@ class ArbitrageBot {
      */
     async checkOpenOrders() {
         try {
-            // BTCTurk açık emirleri
-            const btcturkOrders = await this.btcturk.getOpenOrders('XRPUSDT');
+            // BTCTurk açık emirleri - dinamik symbol
+            const btcturkOrders = await this.btcturk.getOpenOrders(this.config.symbol);
             
             if (btcturkOrders && btcturkOrders.length > 0) {
                 logger.warn('⚠️  BTCTurk\'te açık emirler var!', {
@@ -775,7 +789,7 @@ class ArbitrageBot {
                 logger.info('📤 Binance market BUY emri gönderiliyor...');
 
                 const orderResponse = await this.binance.createMarketOrder({
-                    symbol: 'XRPUSDT',
+                    symbol: this.config.symbol,  // Dinamik symbol
                     side: 'BUY',
                     quantity: preparationDetails.amount
                 });
@@ -793,7 +807,7 @@ class ArbitrageBot {
                 logger.info('📤 Binance market SELL emri gönderiliyor (XRP boşaltılıyor)...');
 
                 const orderResponse = await this.binance.createMarketOrder({
-                    symbol: 'XRPUSDT',
+                    symbol: this.config.symbol,  // Dinamik symbol
                     side: 'SELL',
                     quantity: preparationDetails.amount
                 });
@@ -949,7 +963,7 @@ class ArbitrageBot {
 
             logger.info('📤 BTCTurk\'e limit emir gönderiliyor...', { txId, side: btcturkSide.toUpperCase(), price: orderPrice, amount: orderAmount });
             const orderResponse = await this.btcturk.createLimitOrder({
-                symbol: 'XRPUSDT',
+                symbol: this.config.symbol,  // Dinamik symbol
                 side: btcturkSide,
                 quantity: orderAmount,
                 price: orderPrice
@@ -1132,7 +1146,7 @@ class ArbitrageBot {
                 logger.info(`🔄 Karşı emir deneniyor (Attempt ${attempt}/${maxRetries})...`, { txId, originalOrderId, side: binanceSide, amount });
 
                 const counterOrder = await this.binance.createMarketOrder({
-                    symbol: 'XRPUSDT',
+                    symbol: this.config.symbol,
                     side: binanceSide,
                     quantity: amount
                 });
@@ -1358,8 +1372,8 @@ class ArbitrageBot {
         console.log(`  External: ${formatMemory(memUsage.external)} MB`);
 
         console.log(`\n💼 Bakiyeler:`);
-        console.log(`  BTCTurk: ${status.balances.btcturk.XRP.toFixed(2)} XRP, ${status.balances.btcturk.USDT.toFixed(2)} USDT`);
-        console.log(`  Binance: ${status.balances.binance.XRP.toFixed(2)} XRP, ${status.balances.binance.USDT.toFixed(2)} USDT`);
+        console.log(`  BTCTurk: ${status.balances.btcturk[this.config.baseCoin].toFixed(2)} ${this.config.baseCoin}, ${status.balances.btcturk.USDT.toFixed(2)} USDT`);
+        console.log(`  Binance: ${status.balances.binance[this.config.baseCoin].toFixed(2)} ${this.config.baseCoin}, ${status.balances.binance.USDT.toFixed(2)} USDT`);
         console.log(`\n📊 Fiyatlar:`);
         console.log(`  BTCTurk: BID ${status.prices.btcturk.bid || 'N/A'} / ASK ${status.prices.btcturk.ask || 'N/A'}`);
         console.log(`  Binance: BID ${status.prices.binance.bid || 'N/A'} / ASK ${status.prices.binance.ask || 'N/A'}`);
@@ -1391,13 +1405,16 @@ class ArbitrageBot {
      */
     checkLowBalance() {
         const minBalances = config.trading.safety.minBalance;
+        const baseCoin = this.config.baseCoin;
+        const totalBaseCoinKey = `total${baseCoin}`;
 
-        // BTCTurk XRP kontrolü
-        if (this.balances.btcturk.totalXRP < minBalances.xrp) {
-            notificationService.notifyLowBalance('BTCTurk', 'XRP', this.balances.btcturk.totalXRP, minBalances.xrp).catch(err =>
-                logger.error('Telegram bildirimi gönderilemedi', { error: err.message })
-            );
-        }
+        // BTCTurk baseCoin kontrolü (AVAX/XRP/SOL dinamik)
+        // Not: Şu an config'te sadece USDT min balance var, baseCoin için gerekirse eklenebilir
+        // if (minBalances[baseCoin.toLowerCase()] && this.balances.btcturk[totalBaseCoinKey] < minBalances[baseCoin.toLowerCase()]) {
+        //     notificationService.notifyLowBalance('BTCTurk', baseCoin, this.balances.btcturk[totalBaseCoinKey], minBalances[baseCoin.toLowerCase()]).catch(err =>
+        //         logger.error('Telegram bildirimi gönderilemedi', { error: err.message })
+        //     );
+        // }
 
         // BTCTurk USDT kontrolü
         if (this.balances.btcturk.totalUSDT < minBalances.usdt) {
@@ -1406,12 +1423,13 @@ class ArbitrageBot {
             );
         }
 
-        // Binance XRP kontrolü
-        if (this.balances.binance.totalXRP < minBalances.xrp) {
-            notificationService.notifyLowBalance('Binance', 'XRP', this.balances.binance.totalXRP, minBalances.xrp).catch(err =>
-                logger.error('Telegram bildirimi gönderilemedi', { error: err.message })
-            );
-        }
+        // Binance baseCoin kontrolü (AVAX/XRP/SOL dinamik)
+        // Not: Şu an config'te sadece USDT min balance var, baseCoin için gerekirse eklenebilir
+        // if (minBalances[baseCoin.toLowerCase()] && this.balances.binance[totalBaseCoinKey] < minBalances[baseCoin.toLowerCase()]) {
+        //     notificationService.notifyLowBalance('Binance', baseCoin, this.balances.binance[totalBaseCoinKey], minBalances[baseCoin.toLowerCase()]).catch(err =>
+        //         logger.error('Telegram bildirimi gönderilemedi', { error: err.message })
+        //     );
+        // }
 
         // Binance USDT kontrolü
         if (this.balances.binance.totalUSDT < minBalances.usdt) {

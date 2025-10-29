@@ -101,26 +101,87 @@ const config = {
 
     // Trading Configuration
     trading: {
-        // Coin paritesi (HER İKİ BORSA DA USDT)
-        symbol: process.env.TRADE_SYMBOL || 'XRPUSDT',
-        baseCoin: process.env.BASE_COIN || 'XRP',
-        quoteCoin: process.env.QUOTE_COIN || 'USDT',
-        
-        // Binance için parite (aynı)
-        binanceSymbol: process.env.BINANCE_SYMBOL || 'XRPUSDT',
-        binanceBaseCoin: process.env.BINANCE_BASE_COIN || 'XRP',
-        binanceQuoteCoin: process.env.BINANCE_QUOTE_COIN || 'USDT',
-        
-        // İşlem miktarı
-        tradeAmount: getFloat('TRADE_AMOUNT', 5), // 5 XRP (mevcut bakiyeye göre ayarlandı)
-        
-        // Karlılık ayarları (PHASE 1 - Profesyonel standartlar)
-        minProfit: getFloat('MIN_PROFIT_PERCENT', 0.15), // Minimum %0.15 kar (profesyonel hedef)
-        minSpread: getFloat('MIN_SPREAD_PERCENT', 0.5), // Minimum %0.5 spread (0.3-0.5% brüt = 0.1% net)
-        
-        // Fiyat güncelleme eşiği (yüzde olarak)
-        priceUpdateThreshold: getFloat('PRICE_UPDATE_THRESHOLD', 0.2), // %0.2 değişim
-        
+        // ========================================
+        // ÇOK PARİTE SİSTEMİ (MULTI-PAIR SUPPORT)
+        // ========================================
+        // Buraya istediğin kadar coin ekleyebilirsin!
+        pairs: [
+            // AVAX/USDT (Birincil Parite)
+            {
+                symbol: 'AVAXUSDT',
+                baseCoin: 'AVAX',
+                quoteCoin: 'USDT',
+                tradeAmount: getFloat('AVAX_TRADE_AMOUNT', 0.5), // 0.5 AVAX (~$10)
+                minProfit: getFloat('AVAX_MIN_PROFIT', 0.05),    // %0.05 (agresif)
+                minSpread: getFloat('AVAX_MIN_SPREAD', 0.20),    // %0.20
+                priceUpdateThreshold: getFloat('AVAX_UPDATE_THRESHOLD', 0.15), // %0.15
+
+                // Binance precision
+                binance: {
+                    stepSize: 0.01,      // Min miktar: 0.01 AVAX
+                    tickSize: 0.01,      // Fiyat artışı: $0.01
+                    minQty: 0.01,        // Min emir: 0.01 AVAX
+                    maxQty: 9000000      // Max emir: 9M AVAX
+                },
+
+                // BTCTurk precision
+                btcturk: {
+                    numeratorScale: 2,   // Miktar: 0.50 AVAX
+                    denominatorScale: 2  // Fiyat: 825.14 TRY
+                }
+            },
+
+            // XRP/USDT (İkinci Parite)
+            {
+                symbol: 'XRPUSDT',
+                baseCoin: 'XRP',
+                quoteCoin: 'USDT',
+                tradeAmount: getFloat('XRP_TRADE_AMOUNT', 10),   // 10 XRP
+                minProfit: getFloat('XRP_MIN_PROFIT', 0.03),     // %0.03
+                minSpread: getFloat('XRP_MIN_SPREAD', 0.15),     // %0.15
+                priceUpdateThreshold: getFloat('XRP_UPDATE_THRESHOLD', 0.2), // %0.20
+
+                binance: {
+                    stepSize: 0.1,
+                    tickSize: 0.0001,
+                    minQty: 0.1,
+                    maxQty: 9000000
+                },
+
+                btcturk: {
+                    numeratorScale: 1,
+                    denominatorScale: 4
+                }
+            },
+
+            // SOL/USDT (Üçüncü Parite - Opsiyonel)
+            {
+                symbol: 'SOLUSDT',
+                baseCoin: 'SOL',
+                quoteCoin: 'USDT',
+                tradeAmount: getFloat('SOL_TRADE_AMOUNT', 0.05),  // 0.05 SOL (~$10)
+                minProfit: getFloat('SOL_MIN_PROFIT', 0.05),      // %0.05
+                minSpread: getFloat('SOL_MIN_SPREAD', 0.20),      // %0.20
+                priceUpdateThreshold: getFloat('SOL_UPDATE_THRESHOLD', 0.15), // %0.15
+
+                binance: {
+                    stepSize: 0.01,
+                    tickSize: 0.01,
+                    minQty: 0.01,
+                    maxQty: 9000000
+                },
+
+                btcturk: {
+                    numeratorScale: 2,
+                    denominatorScale: 2
+                }
+            }
+        ],
+
+        // ========================================
+        // GLOBAL AYARLAR (Tüm Pariteler İçin)
+        // ========================================
+
         // İşlem ücretleri (%)
         fees: {
             btcturk: {
@@ -134,24 +195,35 @@ const config = {
         },
 
         // Slippage buffer (market emirler için)
-        slippageBuffer: getFloat('SLIPPAGE_BUFFER', 0.0005), // %0.05 (market order kayması için güvenlik marjı)
-        
-        // Decimal precision
-        precision: {
-            price: getInt('PRICE_PRECISION', 4), // XRP/TRY için 4 decimal
-            quantity: getInt('QUANTITY_PRECISION', 2) // XRP miktarı için 2 decimal
-        },
-        
+        slippageBuffer: getFloat('SLIPPAGE_BUFFER', 0.0005), // %0.05
+
         // Güvenlik limitleri
         safety: {
-            priceSanityCheckThreshold: getFloat('PRICE_SANITY_CHECK_THRESHOLD', 25), // %25, ani fiyat sıçramalarını engellemek için
+            priceSanityCheckThreshold: getFloat('PRICE_SANITY_CHECK_THRESHOLD', 25), // %25
             maxDailyTrades: getInt('MAX_DAILY_TRADES', 100),
             maxDailyLoss: getFloat('MAX_DAILY_LOSS', 100), // USDT cinsinden
             minBalance: {
-                xrp: getFloat('MIN_XRP_BALANCE', 10),
-                usdt: getFloat('MIN_USDT_BALANCE', 10)
+                usdt: getFloat('MIN_USDT_BALANCE', 10)  // Minimum USDT (tüm coinler için)
             },
             minNotionalValue: getFloat('MIN_NOTIONAL_VALUE', 10) // Minimum 10 USDT
+        },
+
+        // ========================================
+        // GERIYE UYUMLULUK (Eski Kodlar İçin)
+        // ========================================
+        // Deprecated: Yeni kodlar pairs[] kullanmalı
+        get symbol() { return this.pairs[0].symbol; },
+        get baseCoin() { return this.pairs[0].baseCoin; },
+        get quoteCoin() { return this.pairs[0].quoteCoin; },
+        get tradeAmount() { return this.pairs[0].tradeAmount; },
+        get minProfit() { return this.pairs[0].minProfit; },
+        get minSpread() { return this.pairs[0].minSpread; },
+        get priceUpdateThreshold() { return this.pairs[0].priceUpdateThreshold; },
+        get precision() {
+            return {
+                price: this.pairs[0].btcturk.denominatorScale,
+                quantity: this.pairs[0].btcturk.numeratorScale
+            };
         }
     },
 
@@ -213,6 +285,27 @@ export function maskApiKey(apiKey) {
 }
 
 /**
+ * Get parite config by symbol
+ * @param {string} symbol - 'AVAXUSDT', 'XRPUSDT', etc.
+ * @returns {object} Parite config object
+ */
+export function getPairConfig(symbol) {
+    const pair = config.trading.pairs.find(p => p.symbol === symbol);
+    if (!pair) {
+        throw new Error(`❌ Parite bulunamadı: ${symbol}\nMevcut pariteler: ${config.trading.pairs.map(p => p.symbol).join(', ')}`);
+    }
+    return pair;
+}
+
+/**
+ * List all available pairs
+ * @returns {Array<string>} Symbol listesi
+ */
+export function listPairs() {
+    return config.trading.pairs.map(p => p.symbol);
+}
+
+/**
  * Print configuration summary (for debugging)
  */
 export function printConfig() {
@@ -221,11 +314,13 @@ export function printConfig() {
     console.log(`Environment: ${config.env}`);
     console.log(`\nBTCTurk API Key: ${maskApiKey(config.btcturk.apiKey)}`);
     console.log(`Binance API Key: ${maskApiKey(config.binance.apiKey)}`);
-    console.log(`\nTrading Symbol: ${config.trading.symbol}`);
-    console.log(`Trade Amount: ${config.trading.tradeAmount} ${config.trading.baseCoin}`);
-    console.log(`Min Profit: ${config.trading.minProfit}%`);
-    console.log(`Min Spread: ${config.trading.minSpread}%`);
-    console.log(`Price Update Threshold: ${config.trading.priceUpdateThreshold * 100}%`);
+    console.log(`\n🪙 Available Pairs: ${config.trading.pairs.length}`);
+    config.trading.pairs.forEach((pair, index) => {
+        console.log(`  ${index + 1}. ${pair.symbol} (${pair.baseCoin}/${pair.quoteCoin})`);
+        console.log(`     Trade Amount: ${pair.tradeAmount} ${pair.baseCoin}`);
+        console.log(`     Min Profit: ${pair.minProfit}%`);
+        console.log(`     Min Spread: ${pair.minSpread}%`);
+    });
     console.log(`\nFees:`);
     console.log(`  BTCTurk Maker: ${(config.trading.fees.btcturk.maker * 100).toFixed(2)}%`);
     console.log(`  BTCTurk Taker: ${(config.trading.fees.btcturk.taker * 100).toFixed(2)}%`);

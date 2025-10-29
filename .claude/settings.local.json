@@ -14,7 +14,11 @@
       "WebFetch(domain:hummingbot.org)",
       "WebFetch(domain:docs.hummingbot.io)",
       "WebFetch(domain:hackmd.io)",
-      "WebFetch(domain:ehgp.github.io)"
+      "WebFetch(domain:ehgp.github.io)",
+      "Bash(tree:*)",
+      "Bash(findstr:*)",
+      "Bash(git -C \"C:\\Users\\hyuce\\Desktop\\SHBOT\" log --oneline -10)",
+      "Bash(curl:*)"
     ],
     "deny": [],
     "ask": []
