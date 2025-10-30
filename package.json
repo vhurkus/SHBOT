@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
-    "test": "node test-phase3.js",
+    "test": "BTCTURK_API_KEY=dummy BTCTURK_API_SECRET=dummy BINANCE_API_KEY=dummy BINANCE_API_SECRET=dummy NODE_OPTIONS=--experimental-vm-modules jest",
     "diagnostic": "node diagnostic.js"
   },
   "keywords": [
@@ -27,6 +27,7 @@
     "ws": "^8.14.2"
   },
   "devDependencies": {
+    "jest": "^30.2.0",
     "nodemon": "^3.0.1"
   }
 }
